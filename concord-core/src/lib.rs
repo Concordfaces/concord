@@ -16,6 +16,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod chunker;
+pub mod shard;
 
 /// Protocol-contract version this crate implements.
 pub const PROTOCOL_VERSION: &str = "concord/1";

@@ -26,7 +26,7 @@ use crate::CHUNK_SIZE;
 pub struct ChunkHash([u8; 32]);
 
 impl ChunkHash {
-    pub fn from_bytes(b: [u8; 32]) -> Self {
+    pub const fn from_bytes(b: [u8; 32]) -> Self {
         Self(b)
     }
 
