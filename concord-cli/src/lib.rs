@@ -5,6 +5,7 @@
 #![deny(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
 
+pub mod cdn;
 pub mod key;
 pub mod pull;
 pub mod push;

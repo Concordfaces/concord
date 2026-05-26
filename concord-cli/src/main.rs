@@ -33,7 +33,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Pull a model version from an operator. `<ref>` is `<name>:<version>`.
+    /// Pull a model version from an operator's CDN.
+    ///
+    /// Pulls hit the public CDN (chunks.eu.concordfaces.org) directly:
+    /// no SigV4, no operator API hop, cache-friendly. Verifies the
+    /// manifest signature with `--pubkey` before reassembling chunks.
     Pull {
         /// Model reference, e.g. `mistral/mixtral-8x22b:v0.3.1`.
         target: String,
@@ -43,8 +47,17 @@ enum Cmd {
         /// 32-byte ed25519 public key (hex). Required to verify the manifest.
         #[arg(long)]
         pubkey: String,
-        #[command(flatten)]
-        store: StoreFlags,
+        /// CDN base URL. The default targets the Concordfaces phase-0 EU
+        /// operator; override for self-hosting or local tests.
+        #[arg(
+            long = "cdn-endpoint",
+            default_value = "https://chunks.eu.concordfaces.org"
+        )]
+        cdn_endpoint: String,
+        /// Bucket name underneath the CDN base. Matches the operator's
+        /// `[store].bucket` setting; phase-0 default is `concord`.
+        #[arg(long = "cdn-bucket", default_value = "concord")]
+        cdn_bucket: String,
     },
     /// Push a model version to an operator.
     Push {
@@ -159,14 +172,16 @@ async fn main() -> Result<()> {
             target,
             out,
             pubkey,
-            store,
+            cdn_endpoint,
+            cdn_bucket,
         } => {
             let model = ModelRef::parse(&target)?;
             let out_dir = out.unwrap_or_else(|| PathBuf::from(model.name.replace('/', "_")));
             let pk = parse_pubkey_hex(&pubkey).context("parse --pubkey")?;
-            let s3 = store.into_store()?;
+            let cdn = concord_cli::cdn::CdnStore::new(cdn_endpoint, cdn_bucket)
+                .map_err(|e| anyhow!("build CDN store: {e}"))?;
             let (manifest, stats) = pull::pull(
-                &s3,
+                &cdn,
                 &PullArgs {
                     name: model.name.clone(),
                     version: model.version.clone(),
