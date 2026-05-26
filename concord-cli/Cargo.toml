@@ -1,0 +1,26 @@
+[package]
+name        = "concord-cli"
+description = "Concord — CLI for the Concordfaces federated model registry. push / pull / verify / sign manifests."
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+rust-version.workspace = true
+
+[[bin]]
+name = "concord"
+path = "src/main.rs"
+
+[dependencies]
+concord-core = { path = "../concord-core", version = "0.1.0" }
+
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest            = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+toml               = { workspace = true }

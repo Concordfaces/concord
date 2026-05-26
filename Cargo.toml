@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "concord-core",
+    "concord-cli",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+license      = "Apache-2.0"
+repository   = "https://github.com/Concordfaces/concord"
+homepage     = "https://concordfaces.org"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow         = "1"
+blake3         = "1"
+ed25519-dalek  = { version = "2", features = ["rand_core", "pkcs8", "pem"] }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+toml           = "0.8"
+thiserror      = "1"
+clap           = { version = "4", features = ["derive"] }
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest        = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+tokio          = { version = "1", features = ["full"] }
+bytes          = "1"
+base64         = "0.22"
+hex            = "0.4"
+time           = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true
