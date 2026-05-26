@@ -1,16 +1,21 @@
 //! Concord core — protocol types for the Concordfaces federated model registry.
 //!
-//! This crate is the implementation reference for [RFC 0001](https://github.com/Concordfaces/rfcs/blob/main/0001-manifest.md).
-//! It is **not** the operator-side serving code (proprietary, separate repo).
-//! Everything here is published as Apache-2.0 so any party can build a
-//! compatible client or a compatible operator implementation.
+//! Reference implementation of [RFC 0001](https://github.com/Concordfaces/rfcs/blob/main/0001-manifest.md).
+//! This crate is **not** the operator-side serving code (that lives in a
+//! separate, proprietary repo). Everything here is published Apache-2.0 so
+//! third parties can build compatible clients or operators.
 //!
-//! Currently this crate exposes only protocol constants and stub types.
-//! The chunker, manifest parser, signer, and verifier land in upcoming
-//! commits per the RFC.
+//! Layering note: this crate's [`chunker`] is the *protocol* layer — fixed
+//! 4 MiB blake3 chunks, content-addressed for dedup + idempotent uploads.
+//! It is orthogonal to whatever the operator's S3 backend does internally
+//! for placement and erasure coding (OpenVerve, for example, performs its
+//! own EC 4+2 split under the hood). The two layers do not know about each
+//! other.
 
 #![deny(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
+
+pub mod chunker;
 
 /// Protocol-contract version this crate implements.
 pub const PROTOCOL_VERSION: &str = "concord/1";
