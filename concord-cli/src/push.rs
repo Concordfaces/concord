@@ -1,0 +1,419 @@
+//! Implementation of `concord push <model-dir>`.
+//!
+//! Walks the dir, chunks each file (one shard per file), HEAD-checks each
+//! chunk against the store before upload (the dedup contract), uploads
+//! new chunks, builds + signs the manifest, writes it to the store.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
+use bytes::Bytes;
+use concord_core::chunker::{self, ChunkRef};
+use concord_core::manifest::{License, Manifest, ManifestHeader, Shard};
+use concord_core::shard::shard_merkle;
+use concord_core::sign;
+use concord_core::store::Store;
+use ed25519_dalek::SigningKey;
+use time::OffsetDateTime;
+
+/// One file's worth of work — what gets hashed, what shard it becomes.
+#[derive(Clone, Debug)]
+struct FilePlan {
+    relpath: String,
+    abspath: PathBuf,
+    role: &'static str,
+    format: String,
+}
+
+/// Per-shard upload accounting, fed back to the caller for the
+/// human-readable summary.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PushStats {
+    pub chunks_total: u64,
+    pub chunks_uploaded: u64,
+    pub chunks_skipped: u64,
+    pub bytes_total: u64,
+    pub bytes_uploaded: u64,
+    pub bytes_skipped: u64,
+}
+
+impl PushStats {
+    fn add(&mut self, other: &PushStats) {
+        self.chunks_total += other.chunks_total;
+        self.chunks_uploaded += other.chunks_uploaded;
+        self.chunks_skipped += other.chunks_skipped;
+        self.bytes_total += other.bytes_total;
+        self.bytes_uploaded += other.bytes_uploaded;
+        self.bytes_skipped += other.bytes_skipped;
+    }
+}
+
+/// Required arguments for [`push`]. Mirrors the CLI flags one-to-one.
+#[derive(Clone, Debug)]
+pub struct PushArgs {
+    pub model_dir: PathBuf,
+    pub name: String,
+    pub version: String,
+    pub key_id: String,
+    pub residency: String,
+    pub license_spdx: String,
+    /// RFC 3339 UTC timestamp ending in `Z`. `None` ⇒ `now`.
+    pub issued_at: Option<String>,
+}
+
+/// Push a model dir into `store`, returning the signed manifest + stats.
+///
+/// The manifest is uploaded under `manifests/<name>/<version>.toml`. The
+/// signed bytes are also returned so the caller (CLI) can print them /
+/// write them locally if desired.
+pub async fn push<S: Store + ?Sized>(
+    store: &S,
+    args: &PushArgs,
+    signing_key: &SigningKey,
+) -> Result<(Manifest, Vec<u8>, PushStats)> {
+    if !args.model_dir.is_dir() {
+        bail!(
+            "model dir does not exist or is not a directory: {}",
+            args.model_dir.display()
+        );
+    }
+
+    let plans = walk_model_dir(&args.model_dir)?;
+    if plans.is_empty() {
+        bail!("model dir is empty: {}", args.model_dir.display());
+    }
+
+    let mut shards: Vec<Shard> = Vec::with_capacity(plans.len());
+    let mut totals = PushStats::default();
+
+    // Per-file: hash chunks (blocking, off the runtime), upload missing
+    // ones in parallel via the store. We don't pipeline across files
+    // because that risks unbounded memory growth on a big model — one
+    // file at a time, each file's chunks fanned out concurrently.
+    for plan in plans {
+        let (refs, bodies) = chunk_file(&plan.abspath)
+            .with_context(|| format!("chunk file {}", plan.abspath.display()))?;
+
+        let merkle = shard_merkle(&refs.iter().map(|r| r.hash).collect::<Vec<_>>());
+        let size: u64 = refs.iter().map(|r| r.len as u64).sum();
+
+        let stats = upload_chunks(store, &refs, bodies)
+            .await
+            .with_context(|| format!("upload chunks for {} ({})", plan.relpath, plan.role))?;
+        totals.add(&stats);
+
+        shards.push(Shard {
+            role: plan.role.to_string(),
+            format: plan.format,
+            parts: Some(refs.len() as u32),
+            size,
+            merkle: merkle.to_string(),
+        });
+    }
+
+    let issued_at = args.issued_at.clone().unwrap_or_else(default_issued_at);
+    if !issued_at.ends_with('Z') {
+        bail!("issued_at must end in Z (RFC 3339 UTC)");
+    }
+
+    let issuer = derive_issuer(&args.key_id);
+    let unsigned = Manifest {
+        manifest: ManifestHeader {
+            name: args.name.clone(),
+            version: args.version.clone(),
+            protocol: concord_core::PROTOCOL_VERSION.to_string(),
+            issuer,
+            issued_at,
+        },
+        license: License {
+            spdx: args.license_spdx.clone(),
+            residency: args.residency.clone(),
+            export: "unrestricted".to_string(),
+        },
+        shards,
+        pull_policy: None,
+        supersedes: None,
+        signature: None,
+    };
+    unsigned.validate().context("manifest validation")?;
+
+    let signed = sign::sign(unsigned, &args.key_id, signing_key)
+        .map_err(|e| anyhow!("sign manifest: {e}"))?;
+    let signed_bytes = signed
+        .to_signed_bytes()
+        .map_err(|e| anyhow!("serialize signed manifest: {e}"))?;
+
+    store
+        .put_manifest(&args.name, &args.version, Bytes::from(signed_bytes.clone()))
+        .await
+        .map_err(|e| anyhow!("put manifest: {e}"))?;
+
+    Ok((signed, signed_bytes, totals))
+}
+
+/// Read + chunk a file. Hashing 4 MiB blake3 chunks on the current thread
+/// blocks the runtime; callers in async context should wrap this in
+/// [`tokio::task::spawn_blocking`]. For typical small phase-0 fixtures
+/// the inline cost is negligible.
+fn chunk_file(path: &Path) -> Result<(Vec<ChunkRef>, Vec<Bytes>)> {
+    let file = std::fs::File::open(path)?;
+    let mut bodies: Vec<Bytes> = Vec::new();
+    let refs = chunker::chunk_stream(file, |_cref, body| {
+        bodies.push(Bytes::copy_from_slice(body));
+        Ok(())
+    })?;
+    Ok((refs, bodies))
+}
+
+async fn upload_chunks<S: Store + ?Sized>(
+    store: &S,
+    refs: &[ChunkRef],
+    bodies: Vec<Bytes>,
+) -> Result<PushStats> {
+    let mut stats = PushStats {
+        chunks_total: refs.len() as u64,
+        bytes_total: refs.iter().map(|r| r.len as u64).sum(),
+        ..Default::default()
+    };
+
+    // Walk in pairs and decide per chunk: skip if has_chunk, else upload.
+    // Done sequentially here — pipelining requires care to bound in-flight
+    // memory; phase-0 fixtures are small enough that sequential is fine.
+    // The same code transparently works against MemoryStore in tests.
+    for (cref, body) in refs.iter().zip(bodies.into_iter()) {
+        let len = cref.len as u64;
+        if store
+            .has_chunk(&cref.hash)
+            .await
+            .map_err(|e| anyhow!("has_chunk: {e}"))?
+        {
+            stats.chunks_skipped += 1;
+            stats.bytes_skipped += len;
+            continue;
+        }
+        store
+            .put_chunk(&cref.hash, body)
+            .await
+            .map_err(|e| anyhow!("put_chunk: {e}"))?;
+        stats.chunks_uploaded += 1;
+        stats.bytes_uploaded += len;
+    }
+
+    Ok(stats)
+}
+
+/// Walk `dir` recursively, mapping each regular file to a [`FilePlan`].
+/// File order is sorted by relative path so a re-push produces a
+/// byte-identical manifest (canonical bytes order shards in input order).
+fn walk_model_dir(dir: &Path) -> Result<Vec<FilePlan>> {
+    let mut out = Vec::new();
+    collect(dir, dir, &mut out)?;
+    out.sort_by(|a, b| a.relpath.cmp(&b.relpath));
+    Ok(out)
+}
+
+fn collect(root: &Path, cur: &Path, out: &mut Vec<FilePlan>) -> Result<()> {
+    for entry in std::fs::read_dir(cur).with_context(|| format!("read_dir {}", cur.display()))? {
+        let entry = entry?;
+        let p = entry.path();
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            collect(root, &p, out)?;
+        } else if meta.is_file() {
+            let relpath = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let (role, format) = classify(&relpath);
+            out.push(FilePlan {
+                relpath,
+                abspath: p,
+                role,
+                format,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Infer `(role, format)` from a file's relative path. Anything we don't
+/// recognise drops to the `aux` role with `bin` format so the manifest
+/// still records it.
+fn classify(relpath: &str) -> (&'static str, String) {
+    let name = relpath.rsplit('/').next().unwrap_or(relpath);
+    let lname = name.to_ascii_lowercase();
+    if lname.ends_with(".safetensors") {
+        ("weights", "safetensors".into())
+    } else if lname.starts_with("tokenizer") && lname.ends_with(".json") {
+        ("tokenizer", "tokenizers.json".into())
+    } else if lname == "config.json" {
+        ("config", "json".into())
+    } else {
+        let ext = lname.rsplit('.').next().unwrap_or("bin").to_string();
+        ("aux", ext)
+    }
+}
+
+fn default_issued_at() -> String {
+    use time::macros::format_description;
+    let now = OffsetDateTime::now_utc();
+    // RFC 3339 UTC ending in Z, second precision.
+    let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+    now.format(fmt).expect("format now")
+}
+
+/// Issuer is the namespace prefix of the key id. e.g.
+/// `eu:test-operator:k/2026-01` → `eu:test-operator`.
+fn derive_issuer(key_id: &str) -> String {
+    match key_id.rsplit_once(':') {
+        Some((prefix, _)) => prefix.to_string(),
+        None => key_id.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use concord_core::store::MemoryStore;
+
+    fn write(dir: &Path, rel: &str, body: &[u8]) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn classify_known_files() {
+        assert_eq!(classify("model.safetensors").0, "weights");
+        assert_eq!(classify("tokenizer.json").0, "tokenizer");
+        assert_eq!(classify("tokenizer.model"), ("aux", "model".into()));
+        assert_eq!(classify("config.json").0, "config");
+        assert_eq!(classify("README.md"), ("aux", "md".into()));
+        // path with subdirs uses the basename, not the dir name.
+        assert_eq!(classify("nested/dir/model.safetensors").0, "weights");
+    }
+
+    #[test]
+    fn derive_issuer_drops_last_segment() {
+        assert_eq!(
+            derive_issuer("eu:test-operator:k/2026-01"),
+            "eu:test-operator"
+        );
+        assert_eq!(derive_issuer("single"), "single");
+    }
+
+    #[tokio::test]
+    async fn push_into_memory_store_roundtrip() {
+        let (sk, _vk) = sign::generate_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "model.safetensors", b"weights body bytes");
+        write(dir.path(), "tokenizer.json", b"{\"vocab\":[]}");
+        write(dir.path(), "config.json", b"{\"hidden\":4}");
+
+        let store = MemoryStore::new();
+        let args = PushArgs {
+            model_dir: dir.path().to_path_buf(),
+            name: "test/tiny".into(),
+            version: "v0.1.0".into(),
+            key_id: "eu:test:k/1".into(),
+            residency: "eu".into(),
+            license_spdx: "Apache-2.0".into(),
+            issued_at: Some("2026-05-26T00:00:00Z".into()),
+        };
+
+        let (m, _bytes, stats) = push(&store, &args, &sk).await.unwrap();
+        assert_eq!(m.shards.len(), 3);
+        assert_eq!(stats.chunks_total, 3);
+        assert_eq!(stats.chunks_uploaded, 3);
+        assert_eq!(stats.chunks_skipped, 0);
+        assert!(m.signature.is_some());
+
+        assert_eq!(store.manifest_count(), 1);
+        assert_eq!(store.chunk_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn push_dedups_identical_files_across_a_push() {
+        // Two files with identical bodies → one chunk total, not two.
+        let (sk, _vk) = sign::generate_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.safetensors", b"identical body");
+        write(dir.path(), "b.safetensors", b"identical body");
+
+        let store = MemoryStore::new();
+        let args = PushArgs {
+            model_dir: dir.path().to_path_buf(),
+            name: "test/dup".into(),
+            version: "v0.1.0".into(),
+            key_id: "eu:test:k/1".into(),
+            residency: "eu".into(),
+            license_spdx: "Apache-2.0".into(),
+            issued_at: Some("2026-05-26T00:00:00Z".into()),
+        };
+
+        let (_m, _b, stats) = push(&store, &args, &sk).await.unwrap();
+        assert_eq!(stats.chunks_total, 2);
+        assert_eq!(stats.chunks_uploaded, 1);
+        assert_eq!(stats.chunks_skipped, 1);
+        assert_eq!(store.chunk_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn push_dedups_across_pushes() {
+        // Second push of the same dir uploads zero chunks.
+        let (sk, _vk) = sign::generate_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "model.safetensors", b"hello");
+        let store = MemoryStore::new();
+        let args = PushArgs {
+            model_dir: dir.path().to_path_buf(),
+            name: "test/m".into(),
+            version: "v1".into(),
+            key_id: "eu:t:k".into(),
+            residency: "eu".into(),
+            license_spdx: "Apache-2.0".into(),
+            issued_at: Some("2026-05-26T00:00:00Z".into()),
+        };
+        let (_, _, s1) = push(&store, &args, &sk).await.unwrap();
+        assert_eq!(s1.chunks_uploaded, 1);
+        let (_, _, s2) = push(&store, &args, &sk).await.unwrap();
+        assert_eq!(s2.chunks_uploaded, 0);
+        assert_eq!(s2.chunks_skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn push_rejects_missing_dir() {
+        let (sk, _vk) = sign::generate_keypair();
+        let store = MemoryStore::new();
+        let args = PushArgs {
+            model_dir: PathBuf::from("/definitely/does/not/exist/xyz"),
+            name: "a/b".into(),
+            version: "v1".into(),
+            key_id: "eu:t:k".into(),
+            residency: "eu".into(),
+            license_spdx: "Apache-2.0".into(),
+            issued_at: Some("2026-05-26T00:00:00Z".into()),
+        };
+        assert!(push(&store, &args, &sk).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn push_rejects_empty_dir() {
+        let (sk, _vk) = sign::generate_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new();
+        let args = PushArgs {
+            model_dir: dir.path().to_path_buf(),
+            name: "a/b".into(),
+            version: "v1".into(),
+            key_id: "eu:t:k".into(),
+            residency: "eu".into(),
+            license_spdx: "Apache-2.0".into(),
+            issued_at: Some("2026-05-26T00:00:00Z".into()),
+        };
+        assert!(push(&store, &args, &sk).await.is_err());
+    }
+}

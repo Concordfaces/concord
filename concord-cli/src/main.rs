@@ -8,9 +8,12 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use concord_cli::key::{load_signing_key, parse_pubkey_hex};
+use concord_cli::pull::{self, ModelRef, PullArgs};
+use concord_cli::push::{self, PushArgs};
 use concord_core::manifest::Manifest;
 use concord_core::sign;
-use ed25519_dalek::{VerifyingKey, PUBLIC_KEY_LENGTH};
+use concord_store_s3::{Credentials, S3Config, S3Store};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -27,15 +30,43 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Pull a model version from an operator.
+    /// Pull a model version from an operator. `<ref>` is `<name>:<version>`.
     Pull {
         /// Model reference, e.g. `mistral/mixtral-8x22b:v0.3.1`.
         target: String,
+        /// Output directory. Defaults to a subdir of `cwd` named after the model.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// 32-byte ed25519 public key (hex). Required to verify the manifest.
+        #[arg(long)]
+        pubkey: String,
+        #[command(flatten)]
+        store: StoreFlags,
     },
     /// Push a model version to an operator.
     Push {
         /// Path to the local model directory.
         path: PathBuf,
+        /// Manifest `[manifest].name`, e.g. `mistral/mixtral-8x22b`.
+        #[arg(long)]
+        name: String,
+        /// Manifest `[manifest].version`, e.g. `v0.3.1`.
+        #[arg(long)]
+        version: String,
+        /// Path to the ed25519 signing key (PKCS#8 PEM or 64-hex seed).
+        #[arg(long)]
+        key: PathBuf,
+        /// Operator-namespaced key id, e.g. `eu:test-operator:k/2026-01`.
+        #[arg(long)]
+        key_id: String,
+        /// Residency token (`eu|na|sa|af|as|oc|any`).
+        #[arg(long, default_value = "eu")]
+        residency: String,
+        /// SPDX license identifier.
+        #[arg(long, default_value = "Apache-2.0")]
+        license: String,
+        #[command(flatten)]
+        store: StoreFlags,
     },
     /// Verify the signature of a manifest TOML file.
     Verify {
@@ -52,6 +83,52 @@ enum Cmd {
         #[command(subcommand)]
         op: ManifestOp,
     },
+}
+
+/// Flags shared by `push` and `pull` for configuring the S3-compatible
+/// backend the operator runs.
+#[derive(clap::Args, Debug)]
+struct StoreFlags {
+    /// S3 endpoint root, e.g. `https://s3.example.org`.
+    #[arg(long = "store-endpoint")]
+    endpoint: String,
+    /// Bucket name, e.g. `concord`.
+    #[arg(long = "store-bucket")]
+    bucket: String,
+    /// AWS region string. CloudVerve accepts anything non-empty.
+    #[arg(long = "store-region", default_value = "us-east-1")]
+    region: String,
+    /// SigV4 access key id. Falls back to `AWS_ACCESS_KEY_ID` env var.
+    #[arg(long = "store-access-key")]
+    access_key: Option<String>,
+    /// SigV4 secret access key. Falls back to `AWS_SECRET_ACCESS_KEY` env var.
+    #[arg(long = "store-secret-key")]
+    secret_key: Option<String>,
+}
+
+impl StoreFlags {
+    fn into_store(self) -> Result<S3Store> {
+        let access_key = self
+            .access_key
+            .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
+            .ok_or_else(|| anyhow!("missing --store-access-key (or AWS_ACCESS_KEY_ID env var)"))?;
+        let secret_key = self
+            .secret_key
+            .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
+            .ok_or_else(|| {
+                anyhow!("missing --store-secret-key (or AWS_SECRET_ACCESS_KEY env var)")
+            })?;
+        let cfg = S3Config {
+            endpoint: self.endpoint,
+            bucket: self.bucket,
+            region: self.region,
+            credentials: Credentials {
+                access_key_id: access_key,
+                secret_access_key: secret_key,
+            },
+        };
+        S3Store::new(cfg).map_err(|e| anyhow!("build S3 store: {e}"))
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -75,13 +152,69 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Cmd::Pull { target } => {
-            tracing::info!(%target, "pull not yet implemented");
-            bail!("pull not yet implemented (lands once storage trait + S3 client are in)");
+        Cmd::Pull {
+            target,
+            out,
+            pubkey,
+            store,
+        } => {
+            let model = ModelRef::parse(&target)?;
+            let out_dir = out.unwrap_or_else(|| PathBuf::from(model.name.replace('/', "_")));
+            let pk = parse_pubkey_hex(&pubkey).context("parse --pubkey")?;
+            let s3 = store.into_store()?;
+            let (manifest, stats) = pull::pull(
+                &s3,
+                &PullArgs {
+                    name: model.name.clone(),
+                    version: model.version.clone(),
+                    out_dir: out_dir.clone(),
+                },
+                &pk,
+            )
+            .await?;
+            print_manifest_summary(&manifest);
+            println!(
+                "\npulled {} files / {} bytes → {}",
+                stats.files,
+                stats.bytes,
+                out_dir.display()
+            );
+            println!("signature: OK");
+            Ok(())
         }
-        Cmd::Push { path } => {
-            tracing::info!(?path, "push not yet implemented");
-            bail!("push not yet implemented (lands once storage trait + S3 client are in)");
+        Cmd::Push {
+            path,
+            name,
+            version,
+            key,
+            key_id,
+            residency,
+            license,
+            store,
+        } => {
+            let sk = load_signing_key(&key).context("load --key")?;
+            let s3 = store.into_store()?;
+            let args = PushArgs {
+                model_dir: path,
+                name: name.clone(),
+                version: version.clone(),
+                key_id,
+                residency,
+                license_spdx: license,
+                issued_at: None,
+            };
+            let (manifest, _bytes, stats) = push::push(&s3, &args, &sk).await?;
+            print_manifest_summary(&manifest);
+            println!(
+                "\nuploaded {}/{} chunks ({} bytes); skipped {} chunks ({} bytes saved by dedup)",
+                stats.chunks_uploaded,
+                stats.chunks_total,
+                stats.bytes_uploaded,
+                stats.chunks_skipped,
+                stats.bytes_skipped
+            );
+            println!("manifest → manifests/{}/{}.toml", name, version);
+            Ok(())
         }
         Cmd::Verify { path, pubkey } => verify(&path, &pubkey),
         Cmd::Manifest { op } => match op {
@@ -96,28 +229,14 @@ async fn main() -> Result<()> {
 fn verify(path: &std::path::Path, pubkey_hex: &str) -> Result<()> {
     let bytes = fs::read(path).with_context(|| format!("read manifest {}", path.display()))?;
     let manifest = Manifest::parse(&bytes).context("parse manifest")?;
-    let pk = parse_pubkey(pubkey_hex).context("parse --pubkey")?;
+    let pk = parse_pubkey_hex(pubkey_hex).context("parse --pubkey")?;
     sign::verify(&manifest, &pk).map_err(|e| anyhow!("signature verification failed: {e}"))?;
-    print_summary(&manifest);
+    print_manifest_summary(&manifest);
     println!("\nsignature: OK");
     Ok(())
 }
 
-fn parse_pubkey(s: &str) -> Result<VerifyingKey> {
-    let s = s.strip_prefix("ed25519:").unwrap_or(s);
-    if s.len() != PUBLIC_KEY_LENGTH * 2 {
-        bail!(
-            "expected {} hex chars (32-byte ed25519 pubkey), got {}",
-            PUBLIC_KEY_LENGTH * 2,
-            s.len()
-        );
-    }
-    let mut bytes = [0u8; PUBLIC_KEY_LENGTH];
-    hex::decode_to_slice(s, &mut bytes).context("invalid hex")?;
-    VerifyingKey::from_bytes(&bytes).map_err(|e| anyhow!("invalid ed25519 pubkey: {e}"))
-}
-
-fn print_summary(m: &Manifest) {
+fn print_manifest_summary(m: &Manifest) {
     println!("manifest:");
     println!("  name      = {}", m.manifest.name);
     println!("  version   = {}", m.manifest.version);
