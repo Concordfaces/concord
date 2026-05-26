@@ -213,6 +213,8 @@ dependencies = [
  "anyhow",
  "clap",
  "concord-core",
+ "ed25519-dalek",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
