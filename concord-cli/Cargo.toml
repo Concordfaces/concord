@@ -17,6 +17,8 @@ concord-core = { path = "../concord-core", version = "0.1.0" }
 
 anyhow             = { workspace = true }
 clap               = { workspace = true }
+ed25519-dalek      = { workspace = true }
+hex                = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
