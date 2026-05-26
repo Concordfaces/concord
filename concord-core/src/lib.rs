@@ -8,7 +8,7 @@
 //! Layering note: this crate's [`chunker`] is the *protocol* layer — fixed
 //! 4 MiB blake3 chunks, content-addressed for dedup + idempotent uploads.
 //! It is orthogonal to whatever the operator's S3 backend does internally
-//! for placement and erasure coding (OpenVerve, for example, performs its
+//! for placement and erasure coding (CloudVerve, for example, performs its
 //! own EC 4+2 split under the hood). The two layers do not know about each
 //! other.
 

@@ -1,13 +1,13 @@
 //! Storage trait for Concord chunk + manifest objects.
 //!
 //! [`Store`] is the abstraction concord-cli `push` / `pull` / `verify`
-//! talk to. A real implementation hits an OpenVerve S3 gateway via HTTP
+//! talk to. A real implementation hits a CloudVerve S3 gateway via HTTP
 //! + SigV4; the [`MemoryStore`] in this module is for tests and local
 //!   development.
 //!
 //! Layering reminder: the Concord chunker (4 MiB fixed blake3,
 //! content-addressed) is the *protocol* layer. Whatever the operator's
-//! S3 backend does internally — OpenVerve's EC 4+2 split across nodes,
+//! S3 backend does internally — CloudVerve's EC 4+2 split across nodes,
 //! AWS's chunked multipart, etc. — is orthogonal. We PUT/GET full
 //! Concord chunks as opaque S3 objects; the backend's internal chunking
 //! does not leak into this trait.
