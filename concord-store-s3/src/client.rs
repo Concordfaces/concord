@@ -268,6 +268,9 @@ fn encode_key(key: &str) -> String {
 mod tests {
     use super::*;
 
+    // Test fixture uses placeholder endpoint + bucket names. The real
+    // operator's endpoint/bucket are operator-internal and never appear
+    // in this public repo (see security: client must not know bucket).
     fn cfg() -> S3Config {
         S3Config {
             endpoint: "https://s3.example.org".into(),
@@ -283,7 +286,7 @@ mod tests {
     #[test]
     fn new_parses_endpoint() {
         let s = S3Store::new(cfg()).unwrap();
-        assert_eq!(s.endpoint_host, "s3.eu.concordfaces.org");
+        assert_eq!(s.endpoint_host, "s3.example.org");
         assert_eq!(s.endpoint_origin, "https://s3.example.org");
     }
 
@@ -315,19 +318,19 @@ mod tests {
     #[test]
     fn manifest_key_layout() {
         let s = S3Store::new(cfg()).unwrap();
-        let k = s.manifest_key("mistral/mixtral-8x22b", "v0.3.1");
-        assert_eq!(k, "manifests/mistral/mixtral-8x22b/v0.3.1.toml");
+        let k = s.manifest_key("org/name", "v0.3.1");
+        assert_eq!(k, "manifests/org/name/v0.3.1.toml");
     }
 
     #[test]
     fn url_for_uses_path_style() {
         let s = S3Store::new(cfg()).unwrap();
-        let (url, path) = s.url_for("manifests/mistral/mixtral-8x22b/v0.3.1.toml");
+        let (url, path) = s.url_for("manifests/org/name/v0.3.1.toml");
         assert_eq!(
             url,
-            "https://s3.example.org/test-bucket/manifests/mistral/mixtral-8x22b/v0.3.1.toml"
+            "https://s3.example.org/test-bucket/manifests/org/name/v0.3.1.toml"
         );
-        assert_eq!(path, "/test-bucket/manifests/mistral/mixtral-8x22b/v0.3.1.toml");
+        assert_eq!(path, "/test-bucket/manifests/org/name/v0.3.1.toml");
     }
 
     #[test]

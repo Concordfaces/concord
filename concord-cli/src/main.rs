@@ -48,16 +48,15 @@ enum Cmd {
         #[arg(long)]
         pubkey: String,
         /// CDN base URL. The default targets the Concordfaces phase-0 EU
-        /// operator; override for self-hosting or local tests.
+        /// operator; override for self-hosting or local tests. The
+        /// operator's bucket prefix is wired into the CDN origin and is
+        /// deliberately NOT exposed as a client-side flag — that would
+        /// let a malicious client probe sibling buckets.
         #[arg(
             long = "cdn-endpoint",
             default_value = "https://chunks.eu.concordfaces.org"
         )]
         cdn_endpoint: String,
-        /// Bucket name underneath the CDN base. Matches the operator's
-        /// `[store].bucket` setting; phase-0 default is `concord`.
-        #[arg(long = "cdn-bucket", default_value = "concord")]
-        cdn_bucket: String,
     },
     /// Push a model version to an operator.
     Push {
@@ -173,12 +172,11 @@ async fn main() -> Result<()> {
             out,
             pubkey,
             cdn_endpoint,
-            cdn_bucket,
         } => {
             let model = ModelRef::parse(&target)?;
             let out_dir = out.unwrap_or_else(|| PathBuf::from(model.name.replace('/', "_")));
             let pk = parse_pubkey_hex(&pubkey).context("parse --pubkey")?;
-            let cdn = concord_cli::cdn::CdnStore::new(cdn_endpoint, cdn_bucket)
+            let cdn = concord_cli::cdn::CdnStore::new(cdn_endpoint)
                 .map_err(|e| anyhow!("build CDN store: {e}"))?;
             let (manifest, stats) = pull::pull(
                 &cdn,
