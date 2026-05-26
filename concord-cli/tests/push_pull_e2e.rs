@@ -156,7 +156,11 @@ async fn second_push_is_full_dedup() {
     assert!(s1.chunks_uploaded > 0);
 
     let (_, _, s2) = push(&store, &args, &sk).await.unwrap();
-    assert_eq!(s2.chunks_uploaded, 0);
-    assert_eq!(s2.chunks_skipped, s2.chunks_total);
+    // PUT-always behaviour: second push re-uploads every chunk, but
+    // because the storage layer is content-addressed by blake3 the on-disk
+    // chunk count is unchanged. This guards the backend-side dedup
+    // guarantee even though client-side skip is gone.
+    assert_eq!(s2.chunks_uploaded, s2.chunks_total);
+    assert_eq!(s2.chunks_skipped, 0);
     assert_eq!(store.chunk_count(), chunks_after_first);
 }

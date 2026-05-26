@@ -184,15 +184,9 @@ impl Store for S3Store {
 
     async fn put_chunk(&self, hash: &ChunkHash, body: Bytes) -> Result<(), StoreError> {
         let key = self.chunk_key(hash);
-        // `If-None-Match: *` makes the PUT a no-op if the object already
-        // exists, so a duplicate push does not waste bytes-on-the-wire on
-        // the response body of an overwrite the backend would silently
-        // accept otherwise. Treat 412 (precondition failed) as success —
-        // it means "yes, you already had this; doing nothing".
-        let mut extra = BTreeMap::new();
-        extra.insert("if-none-match".into(), "*".into());
-
-        let resp = self.signed_request("PUT", &key, Some(body), extra).await?;
+        let resp = self
+            .signed_request("PUT", &key, Some(body), BTreeMap::new())
+            .await?;
         match resp.status() {
             s if s.is_success() => Ok(()),
             StatusCode::PRECONDITION_FAILED => Ok(()),

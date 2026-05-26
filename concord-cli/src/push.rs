@@ -228,24 +228,18 @@ async fn upload_chunks<S: Store + ?Sized>(
         ..Default::default()
     };
 
-    // Walk in pairs and decide per chunk: skip if has_chunk, else upload.
-    // Done sequentially here — pipelining requires care to bound in-flight
-    // memory; phase-0 fixtures are small enough that sequential is fine.
-    // The same code transparently works against MemoryStore in tests.
+    // PUT-always. Backend is content-addressed (key = blake3 hash), so a
+    // redundant write of an identical chunk is a no-op at the storage
+    // layer. Skipping the per-chunk `has_chunk` HEAD avoids two known
+    // failure modes against CloudVerve: (1) HEAD on a non-existent
+    // `chunks/<hh>/<64hex>` key hangs the connection forever; (2) a
+    // timed-out HEAD on a pooled connection poisons subsequent PUTs on
+    // that same connection with `error sending request`. MemoryStore
+    // tolerates the duplicate PUT (overwrite). The on-the-wire cost is
+    // duplicate writes for already-uploaded chunks; acceptable for
+    // phase-0 push throughput.
     for (cref, body) in refs.iter().zip(bodies.into_iter()) {
         let len = cref.len as u64;
-        if store
-            .has_chunk(&cref.hash)
-            .await
-            .map_err(|e| anyhow!("has_chunk: {e}"))?
-        {
-            stats.chunks_skipped += 1;
-            stats.bytes_skipped += len;
-            if let Some(cb) = progress {
-                cb(ProgressEvent::Skipped { bytes: len });
-            }
-            continue;
-        }
         store
             .put_chunk(&cref.hash, body)
             .await
@@ -414,8 +408,11 @@ mod tests {
 
         let (_m, _b, stats) = push(&store, &args, &sk).await.unwrap();
         assert_eq!(stats.chunks_total, 2);
-        assert_eq!(stats.chunks_uploaded, 1);
-        assert_eq!(stats.chunks_skipped, 1);
+        // Per chunk we PUT-always; backend dedups by content-addressed key.
+        // Both chunks are uploaded (idempotent overwrite), but the store
+        // ends up holding exactly one.
+        assert_eq!(stats.chunks_uploaded, 2);
+        assert_eq!(stats.chunks_skipped, 0);
         assert_eq!(store.chunk_count(), 1);
     }
 
@@ -437,9 +434,12 @@ mod tests {
         };
         let (_, _, s1) = push(&store, &args, &sk).await.unwrap();
         assert_eq!(s1.chunks_uploaded, 1);
+        // Re-push re-uploads (idempotent at content-addressed backend),
+        // chunk_count stays at 1 because the key is the blake3 hash.
         let (_, _, s2) = push(&store, &args, &sk).await.unwrap();
-        assert_eq!(s2.chunks_uploaded, 0);
-        assert_eq!(s2.chunks_skipped, 1);
+        assert_eq!(s2.chunks_uploaded, 1);
+        assert_eq!(s2.chunks_skipped, 0);
+        assert_eq!(store.chunk_count(), 1);
     }
 
     #[tokio::test]
