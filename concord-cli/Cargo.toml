@@ -19,6 +19,7 @@ path = "src/main.rs"
 concord-core     = { path = "../concord-core",     version = "0.1.0" }
 concord-store-s3 = { path = "../concord-store-s3", version = "0.1.0" }
 
+indicatif          = "0.17"
 anyhow             = { workspace = true }
 async-trait        = { workspace = true }
 base64             = { workspace = true }

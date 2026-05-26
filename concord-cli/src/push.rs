@@ -61,6 +61,23 @@ pub struct PushArgs {
     pub issued_at: Option<String>,
 }
 
+/// Progress callback emitted per chunk decision. CLI hooks indicatif here;
+/// library + tests leave it `None`.
+pub type ProgressFn = std::sync::Arc<dyn Fn(ProgressEvent) + Send + Sync>;
+
+/// One event per chunk decision (or per file boundary).
+#[derive(Clone, Debug)]
+pub enum ProgressEvent {
+    /// Up-front: total bytes + chunk count discovered by walking the dir.
+    Plan { total_bytes: u64, total_chunks: u64 },
+    /// A chunk was uploaded (new bytes hit the wire).
+    Uploaded { bytes: u64 },
+    /// A chunk was skipped (dedup hit; zero wire bytes).
+    Skipped { bytes: u64 },
+    /// Whole push complete.
+    Done,
+}
+
 /// Push a model dir into `store`, returning the signed manifest + stats.
 ///
 /// The manifest is uploaded under `manifests/<name>/<version>.toml`. The
@@ -70,6 +87,16 @@ pub async fn push<S: Store + ?Sized>(
     store: &S,
     args: &PushArgs,
     signing_key: &SigningKey,
+) -> Result<(Manifest, Vec<u8>, PushStats)> {
+    push_with_progress(store, args, signing_key, None).await
+}
+
+/// Variant of [`push`] that emits [`ProgressEvent`]s through the callback.
+pub async fn push_with_progress<S: Store + ?Sized>(
+    store: &S,
+    args: &PushArgs,
+    signing_key: &SigningKey,
+    progress: Option<ProgressFn>,
 ) -> Result<(Manifest, Vec<u8>, PushStats)> {
     if !args.model_dir.is_dir() {
         bail!(
@@ -81,6 +108,26 @@ pub async fn push<S: Store + ?Sized>(
     let plans = walk_model_dir(&args.model_dir)?;
     if plans.is_empty() {
         bail!("model dir is empty: {}", args.model_dir.display());
+    }
+
+    // Pre-scan: total bytes on disk + a chunk-count estimate (ceil-divide
+    // by 4 MiB). Emitted up-front so the CLI can prime a sized progress
+    // bar before any work begins.
+    if let Some(cb) = progress.as_ref() {
+        let total_bytes: u64 = plans
+            .iter()
+            .filter_map(|p| std::fs::metadata(&p.abspath).ok().map(|m| m.len()))
+            .sum();
+        let chunk_sz = concord_core::CHUNK_SIZE as u64;
+        let total_chunks = plans
+            .iter()
+            .filter_map(|p| std::fs::metadata(&p.abspath).ok())
+            .map(|m| m.len().div_ceil(chunk_sz))
+            .sum();
+        cb(ProgressEvent::Plan {
+            total_bytes,
+            total_chunks,
+        });
     }
 
     let mut shards: Vec<Shard> = Vec::with_capacity(plans.len());
@@ -97,7 +144,7 @@ pub async fn push<S: Store + ?Sized>(
         let merkle = shard_merkle(&refs.iter().map(|r| r.hash).collect::<Vec<_>>());
         let size: u64 = refs.iter().map(|r| r.len as u64).sum();
 
-        let stats = upload_chunks(store, &refs, bodies)
+        let stats = upload_chunks(store, &refs, bodies, progress.as_ref())
             .await
             .with_context(|| format!("upload chunks for {} ({})", plan.relpath, plan.role))?;
         totals.add(&stats);
@@ -148,6 +195,10 @@ pub async fn push<S: Store + ?Sized>(
         .await
         .map_err(|e| anyhow!("put manifest: {e}"))?;
 
+    if let Some(cb) = progress.as_ref() {
+        cb(ProgressEvent::Done);
+    }
+
     Ok((signed, signed_bytes, totals))
 }
 
@@ -169,6 +220,7 @@ async fn upload_chunks<S: Store + ?Sized>(
     store: &S,
     refs: &[ChunkRef],
     bodies: Vec<Bytes>,
+    progress: Option<&ProgressFn>,
 ) -> Result<PushStats> {
     let mut stats = PushStats {
         chunks_total: refs.len() as u64,
@@ -189,6 +241,9 @@ async fn upload_chunks<S: Store + ?Sized>(
         {
             stats.chunks_skipped += 1;
             stats.bytes_skipped += len;
+            if let Some(cb) = progress {
+                cb(ProgressEvent::Skipped { bytes: len });
+            }
             continue;
         }
         store
@@ -197,6 +252,9 @@ async fn upload_chunks<S: Store + ?Sized>(
             .map_err(|e| anyhow!("put_chunk: {e}"))?;
         stats.chunks_uploaded += 1;
         stats.bytes_uploaded += len;
+        if let Some(cb) = progress {
+            cb(ProgressEvent::Uploaded { bytes: len });
+        }
     }
 
     Ok(stats)
