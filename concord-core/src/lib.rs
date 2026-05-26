@@ -19,6 +19,7 @@ pub mod chunker;
 pub mod manifest;
 pub mod shard;
 pub mod sign;
+pub mod store;
 
 /// Protocol-contract version this crate implements.
 pub const PROTOCOL_VERSION: &str = "concord/1";
