@@ -16,6 +16,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod chunker;
+pub mod manifest;
 pub mod shard;
 
 /// Protocol-contract version this crate implements.
