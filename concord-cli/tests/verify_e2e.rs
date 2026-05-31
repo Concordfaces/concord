@@ -37,6 +37,7 @@ fn sample() -> Manifest {
             parts: Some(1),
             size: 4096,
             merkle: "b3:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+            chunks: vec![],
         }],
         pull_policy: None,
         supersedes: None,

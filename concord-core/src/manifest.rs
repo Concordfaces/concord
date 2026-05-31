@@ -63,6 +63,14 @@ pub struct Shard {
     pub size: u64,
     /// `b3:<64-hex>` blake3 merkle root.
     pub merkle: String,
+    /// Ordered `b3:<64-hex>` chunk hashes whose merkle root equals `merkle`
+    /// (RFC 0001 §Shards). REQUIRED to retrieve a multi-chunk shard; MAY be
+    /// omitted for a single-chunk shard, where `merkle` IS the chunk hash.
+    /// Self-authenticating: a client MUST verify `shard_merkle(chunks) ==
+    /// merkle`, and `merkle` is covered by the manifest signature — so the
+    /// chunk list needs no separate signature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -161,6 +169,7 @@ impl Manifest {
             }
             writeln!(out, "size     = {}", s.size).unwrap();
             write_kv_str(&mut out, "merkle", &s.merkle);
+            write_kv_str_array(&mut out, "chunks", &s.chunks);
             writeln!(out).unwrap();
         }
 
@@ -301,6 +310,7 @@ mod tests {
                     size: 90_172_948_480,
                     merkle: "b3:7a4e9c2f9b1d0000000000000000000000000000000000000000000000000000"
                         .into(),
+                    chunks: vec![],
                 },
                 Shard {
                     role: "tokenizer".into(),
@@ -309,6 +319,7 @@ mod tests {
                     size: 2_412_904,
                     merkle: "b3:88a0f0e1000000000000000000000000000000000000000000000000000000000"
                         .into(),
+                    chunks: vec![],
                 },
             ],
             pull_policy: None,

@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use concord_core::chunker::{self, ChunkRef};
+use futures::stream::{StreamExt, TryStreamExt};
+use concord_core::chunker::{self, ChunkHash, ChunkRef};
 use concord_core::manifest::{License, Manifest, ManifestHeader, Shard};
 use concord_core::shard::shard_merkle;
 use concord_core::sign;
@@ -149,12 +150,18 @@ pub async fn push_with_progress<S: Store + ?Sized>(
             .with_context(|| format!("upload chunks for {} ({})", plan.relpath, plan.role))?;
         totals.add(&stats);
 
+        // Carry the ordered chunk hashes so multi-chunk shards are
+        // retrievable (RFC 0001 §Shards). The signed merkle vouches for the
+        // list; pull verifies shard_merkle(chunks) == merkle.
+        let chunks: Vec<String> = refs.iter().map(|r| r.hash.to_string()).collect();
+
         shards.push(Shard {
             role: plan.role.to_string(),
             format: plan.format,
             parts: Some(refs.len() as u32),
             size,
             merkle: merkle.to_string(),
+            chunks,
         });
     }
 
@@ -216,6 +223,57 @@ fn chunk_file(path: &Path) -> Result<(Vec<ChunkRef>, Vec<Bytes>)> {
     Ok((refs, bodies))
 }
 
+/// Number of attempts for `put_chunk` before giving up. The first attempt
+/// is the one inside the main loop; this is the retry budget. Chosen so
+/// a flaky CloudVerve EC quorum (~1 in N chunks deadlines silently on
+/// aarch64; opensharded#324) doesn't tank an entire push.
+const PUT_CHUNK_RETRIES: usize = 5;
+
+/// Default max chunk PUTs in flight per file; override with
+/// `CONCORD_UPLOAD_CONCURRENCY`.
+const DEFAULT_UPLOAD_CONCURRENCY: usize = 32;
+
+/// Chunk-PUT concurrency, from `CONCORD_UPLOAD_CONCURRENCY` (clamped ≥1),
+/// else [`DEFAULT_UPLOAD_CONCURRENCY`].
+fn upload_concurrency() -> usize {
+    std::env::var("CONCORD_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(DEFAULT_UPLOAD_CONCURRENCY)
+}
+
+/// Retry `put_chunk` with exponential backoff. Idempotent at the storage
+/// layer because chunks are blake3-addressed — a repeat PUT of the same
+/// hash is a no-op or an identical overwrite.
+async fn put_chunk_with_retry<S: Store + ?Sized>(
+    store: &S,
+    hash: &ChunkHash,
+    body: Bytes,
+) -> Result<()> {
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut delay = std::time::Duration::from_secs(1);
+    for attempt in 0..=PUT_CHUNK_RETRIES {
+        match store.put_chunk(hash, body.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = format!(
+                    "put_chunk attempt {} of {}: {e}",
+                    attempt + 1,
+                    PUT_CHUNK_RETRIES + 1
+                );
+                if attempt < PUT_CHUNK_RETRIES {
+                    tracing::warn!("{msg}, retrying in {:?}", delay);
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                }
+                last_err = Some(anyhow!(msg));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("put_chunk: exhausted retries")))
+}
+
 async fn upload_chunks<S: Store + ?Sized>(
     store: &S,
     refs: &[ChunkRef],
@@ -238,18 +296,27 @@ async fn upload_chunks<S: Store + ?Sized>(
     // tolerates the duplicate PUT (overwrite). The on-the-wire cost is
     // duplicate writes for already-uploaded chunks; acceptable for
     // phase-0 push throughput.
-    for (cref, body) in refs.iter().zip(bodies.into_iter()) {
-        let len = cref.len as u64;
-        store
-            .put_chunk(&cref.hash, body)
-            .await
-            .map_err(|e| anyhow!("put_chunk: {e}"))?;
-        stats.chunks_uploaded += 1;
-        stats.bytes_uploaded += len;
-        if let Some(cb) = progress {
-            cb(ProgressEvent::Uploaded { bytes: len });
-        }
-    }
+    // Fan out chunk PUTs with bounded concurrency. `Store: Send + Sync`, so
+    // `&store` is shared across the in-flight futures (no Arc / no spawn —
+    // the stream is driven within this fn, so borrows of `refs`/`progress`
+    // are sound). Content-addressed PUT-always means order doesn't matter.
+    let uploaded: Vec<u64> = futures::stream::iter(refs.iter().zip(bodies.into_iter()))
+        .map(|(cref, body)| {
+            let len = cref.len as u64;
+            async move {
+                put_chunk_with_retry(store, &cref.hash, body).await?;
+                if let Some(cb) = progress {
+                    cb(ProgressEvent::Uploaded { bytes: len });
+                }
+                Ok::<u64, anyhow::Error>(len)
+            }
+        })
+        .buffer_unordered(upload_concurrency())
+        .try_collect()
+        .await?;
+
+    stats.chunks_uploaded = uploaded.len() as u64;
+    stats.bytes_uploaded = uploaded.iter().sum();
 
     Ok(stats)
 }

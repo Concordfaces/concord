@@ -118,6 +118,7 @@ mod tests {
                 size: 1234,
                 merkle: "b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .into(),
+                chunks: vec![],
             }],
             pull_policy: None,
             supersedes: None,

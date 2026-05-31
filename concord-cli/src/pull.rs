@@ -91,40 +91,61 @@ pub async fn pull<S: Store + ?Sized>(
 /// Fetch all chunks for `shard`, verify the merkle root matches the
 /// manifest's claim, and write the reassembled bytes to disk.
 async fn pull_shard<S: Store + ?Sized>(store: &S, shard: &Shard, out_dir: &Path) -> Result<u64> {
-    // We don't actually have the per-chunk hash list in the manifest
-    // (RFC 0001 only carries the merkle root); for the phase-0 single-
-    // chunk-per-file fixtures this happens to coincide — root == chunk.
-    // For multi-chunk shards we'd need a sidecar chunk index. Surface
-    // that limitation explicitly rather than silently producing junk.
-    if shard.parts.unwrap_or(1) > 1 {
-        bail!(
-            "shard {} has {} chunks; multi-chunk pull needs a chunk-index sidecar (tracked in RFC 0001 open issues)",
-            shard.role,
-            shard.parts.unwrap_or(1)
-        );
-    }
+    // Resolve the ordered chunk-hash list for this shard.
+    //   - Multi-chunk (and new single-chunk) shards carry `chunks` in the
+    //     manifest (RFC 0001 §Shards).
+    //   - Legacy single-chunk shards omit it; then the merkle root IS the
+    //     one chunk's hash.
+    let chunk_hashes: Vec<ChunkHash> = if !shard.chunks.is_empty() {
+        shard
+            .chunks
+            .iter()
+            .map(|h| {
+                h.parse::<ChunkHash>()
+                    .with_context(|| format!("parse chunk hash {h}"))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let parts = shard.parts.unwrap_or(1);
+        if parts > 1 {
+            bail!(
+                "shard {} has {} chunks but the manifest carries no chunk list \
+                 (predates RFC 0001 chunk-index) — re-push to migrate",
+                shard.role,
+                parts
+            );
+        }
+        vec![shard
+            .merkle
+            .parse::<ChunkHash>()
+            .with_context(|| format!("parse shard merkle: {}", shard.merkle))?]
+    };
 
-    // Single-chunk shard: the merkle root IS the chunk hash.
-    let hash: ChunkHash = shard
-        .merkle
-        .parse()
-        .with_context(|| format!("parse shard merkle: {}", shard.merkle))?;
-
-    let body = store
-        .get_chunk(&hash)
-        .await
-        .map_err(|e| anyhow!("get chunk {hash}: {e}"))?;
-
-    // Sanity check: re-derive the merkle from the fetched bytes' chunk
-    // hash, verify it matches what the manifest claims.
-    let recomputed = shard_merkle(&[ChunkHash::of(&body)]);
+    // Authenticate the chunk list against the signed merkle root: the
+    // manifest signature covers `merkle`, so a matching recomputed root
+    // proves the list is genuine (no separate sidecar signature needed).
+    let recomputed = shard_merkle(&chunk_hashes);
     if recomputed.to_string() != shard.merkle {
         bail!(
-            "shard {} merkle mismatch after reassembly: manifest={} actual={}",
+            "shard {} chunk list does not match signed merkle: manifest={} computed={}",
             shard.role,
             shard.merkle,
             recomputed
         );
+    }
+
+    // Fetch each chunk, verify its content hash, concatenate in order.
+    let mut body: Vec<u8> = Vec::with_capacity(shard.size as usize);
+    for h in &chunk_hashes {
+        let bytes = store
+            .get_chunk(h)
+            .await
+            .map_err(|e| anyhow!("get chunk {h}: {e}"))?;
+        let got = ChunkHash::of(&bytes);
+        if got.to_string() != h.to_string() {
+            bail!("chunk {h} content hash mismatch: got {got}");
+        }
+        body.extend_from_slice(&bytes);
     }
 
     let filename = shard_filename(shard);
@@ -173,6 +194,7 @@ mod tests {
             parts: None,
             size: 0,
             merkle: String::new(),
+            chunks: vec![],
         };
         assert_eq!(
             shard_filename(&mk("weights", "safetensors")),
@@ -184,5 +206,57 @@ mod tests {
         );
         assert_eq!(shard_filename(&mk("config", "json")), "config.json");
         assert_eq!(shard_filename(&mk("adapter", "lora")), "adapter.lora");
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_shard_reassembles_in_order() {
+        use concord_core::store::MemoryStore;
+        let store = MemoryStore::new();
+        let bodies: Vec<Vec<u8>> = vec![vec![1u8; 100], vec![2u8; 80], vec![3u8; 50]];
+        let mut hashes = Vec::new();
+        for b in &bodies {
+            let h = ChunkHash::of(b.as_slice());
+            store
+                .put_chunk(&h, bytes::Bytes::from(b.clone()))
+                .await
+                .unwrap();
+            hashes.push(h);
+        }
+        let merkle = shard_merkle(&hashes);
+        let shard = Shard {
+            role: "weights".into(),
+            format: "bin".into(),
+            parts: Some(3),
+            size: 230,
+            merkle: merkle.to_string(),
+            chunks: hashes.iter().map(|h| h.to_string()).collect(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let n = pull_shard(&store, &shard, dir.path()).await.unwrap();
+        assert_eq!(n, 230);
+        let got = std::fs::read(dir.path().join("weights.bin")).unwrap();
+        let expect: Vec<u8> = bodies.concat();
+        assert_eq!(got, expect, "reassembled bytes must match concat in order");
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_list_not_matching_merkle_is_rejected() {
+        use concord_core::store::MemoryStore;
+        let store = MemoryStore::new();
+        let b = vec![9u8; 10];
+        let h = ChunkHash::of(b.as_slice());
+        store.put_chunk(&h, bytes::Bytes::from(b)).await.unwrap();
+        // merkle claims something the chunk list can't produce → must fail
+        // (the signature covers merkle, so a tampered list is caught here).
+        let shard = Shard {
+            role: "weights".into(),
+            format: "bin".into(),
+            parts: Some(2),
+            size: 20,
+            merkle: "b3:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            chunks: vec![h.to_string(), h.to_string()],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert!(pull_shard(&store, &shard, dir.path()).await.is_err());
     }
 }
