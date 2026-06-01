@@ -216,9 +216,16 @@ impl Store for S3Store {
 
     async fn put_manifest(&self, name: &str, version: &str, body: Bytes) -> Result<(), StoreError> {
         let key = self.manifest_key(name, version);
-        let mut extra = BTreeMap::new();
-        extra.insert("content-type".into(), "application/toml".into());
-        let resp = self.signed_request("PUT", &key, Some(body), extra).await?;
+        // Intentionally NOT signing a content-type header. CloudVerve's
+        // SigV4 verifier reconstructs canonical headers from a fixed set
+        // (host + x-amz-*) and ignores client-provided content-type; if
+        // we include it in our SignedHeaders list the verifier computes a
+        // different canonical request → 403. Sending the body untyped
+        // (or with reqwest's default) is fine — the manifest TOML is
+        // identified by the .toml suffix in the key, not the header.
+        let resp = self
+            .signed_request("PUT", &key, Some(body), BTreeMap::new())
+            .await?;
         match resp.status() {
             s if s.is_success() => Ok(()),
             other => {
