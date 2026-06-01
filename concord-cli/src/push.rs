@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use futures::stream::{StreamExt, TryStreamExt};
 use concord_core::chunker::{self, ChunkHash, ChunkRef};
 use concord_core::manifest::{License, Manifest, ManifestHeader, Shard};
 use concord_core::shard::shard_merkle;
 use concord_core::sign;
 use concord_core::store::Store;
 use ed25519_dalek::SigningKey;
+use futures::stream::{StreamExt, TryStreamExt};
 use time::OffsetDateTime;
 
 /// One file's worth of work — what gets hashed, what shard it becomes.

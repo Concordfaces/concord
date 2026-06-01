@@ -49,6 +49,26 @@ pub fn parse_pubkey_hex(s: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&bytes).map_err(|e| anyhow!("invalid ed25519 pubkey: {e}"))
 }
 
+/// Resolve an operator's verifying key from a `.well-known/concord/keys.json`
+/// document, keyed by manifest issuer. The document is a flat JSON object
+/// mapping issuer → ed25519 pubkey hex (with optional `ed25519:` prefix):
+///
+/// ```json
+/// { "concordfaces": "ed25519:1f8b…", "another-op": "9a2c…" }
+/// ```
+///
+/// This is what lets `concord pull` work without `--pubkey`: fetch the
+/// operator's published keys, look up the issuer named in the (as-yet
+/// unverified) manifest, then verify the signature against the resolved key.
+pub fn resolve_issuer_key(keys_json: &[u8], issuer: &str) -> Result<VerifyingKey> {
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_slice(keys_json).context("parse keys.json")?;
+    let hex = map
+        .get(issuer)
+        .ok_or_else(|| anyhow!("issuer {issuer:?} not published in keys.json"))?;
+    parse_pubkey_hex(hex).with_context(|| format!("pubkey for issuer {issuer:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +120,38 @@ mod tests {
     fn parse_pubkey_hex_rejects_garbage() {
         assert!(parse_pubkey_hex("xx").is_err());
         assert!(parse_pubkey_hex("zz".repeat(32).as_str()).is_err());
+    }
+
+    #[test]
+    fn resolve_issuer_key_looks_up_by_issuer() {
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let want = sk.verifying_key();
+        let json = format!(
+            r#"{{"concordfaces":"{}","other":"{}"}}"#,
+            hex::encode(want.to_bytes()),
+            hex::encode([1u8; 32])
+        );
+        let vk = resolve_issuer_key(json.as_bytes(), "concordfaces").unwrap();
+        assert_eq!(vk.to_bytes(), want.to_bytes());
+    }
+
+    #[test]
+    fn resolve_issuer_key_accepts_ed25519_prefix() {
+        let sk = SigningKey::from_bytes(&[6u8; 32]);
+        let want = sk.verifying_key();
+        let json = format!(r#"{{"op":"ed25519:{}"}}"#, hex::encode(want.to_bytes()));
+        let vk = resolve_issuer_key(json.as_bytes(), "op").unwrap();
+        assert_eq!(vk.to_bytes(), want.to_bytes());
+    }
+
+    #[test]
+    fn resolve_issuer_key_unknown_issuer_errors() {
+        let json = format!(r#"{{"a":"{}"}}"#, hex::encode([2u8; 32]));
+        assert!(resolve_issuer_key(json.as_bytes(), "missing").is_err());
+    }
+
+    #[test]
+    fn resolve_issuer_key_rejects_malformed_json() {
+        assert!(resolve_issuer_key(b"not json", "a").is_err());
     }
 }

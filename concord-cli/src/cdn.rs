@@ -70,6 +70,16 @@ impl CdnStore {
         format!("{}/manifests/{}/{}.toml", self.base, name, version)
     }
 
+    fn keys_url(&self) -> String {
+        format!("{}/.well-known/concord/keys.json", self.base)
+    }
+
+    /// Fetch the operator's published `keys.json` (issuer → ed25519 pubkey).
+    /// Used to resolve the verifying key when `--pubkey` is omitted.
+    pub async fn fetch_well_known_keys(&self) -> Result<Bytes, StoreError> {
+        self.fetch(&self.keys_url()).await
+    }
+
     async fn fetch(&self, url: &str) -> Result<Bytes, StoreError> {
         let resp = self
             .http
@@ -157,6 +167,15 @@ mod tests {
     #[test]
     fn rejects_empty_base() {
         assert!(CdnStore::new("").is_err());
+    }
+
+    #[test]
+    fn keys_url_is_well_known() {
+        let s = CdnStore::new(TEST_BASE).unwrap();
+        assert_eq!(
+            s.keys_url(),
+            format!("{TEST_BASE}/.well-known/concord/keys.json")
+        );
     }
 
     #[tokio::test]

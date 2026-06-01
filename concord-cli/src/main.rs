@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use concord_cli::key::{load_signing_key, parse_pubkey_hex};
-use concord_cli::pull::{self, ModelRef, PullArgs};
+use concord_cli::fmt::human_bytes;
+use concord_cli::key::{load_signing_key, parse_pubkey_hex, resolve_issuer_key};
+use concord_cli::pull::{self, ModelRef, PullArgs, PullEvent, PullProgress};
 use concord_cli::push::{self, ProgressEvent, ProgressFn, PushArgs};
 use concord_core::manifest::Manifest;
 use concord_core::sign;
@@ -36,17 +37,23 @@ enum Cmd {
     /// Pull a model version from an operator's CDN.
     ///
     /// Pulls hit the public CDN (chunks.eu.concordfaces.org) directly:
-    /// no SigV4, no operator API hop, cache-friendly. Verifies the
-    /// manifest signature with `--pubkey` before reassembling chunks.
+    /// no SigV4, no operator API hop, cache-friendly. The manifest
+    /// signature is always verified before any chunk is written; the
+    /// verifying key comes from `--pubkey` or, if omitted, the operator's
+    /// published `.well-known/concord/keys.json` (resolved by issuer).
+    /// Chunks are cached under `~/.cache/concord/chunks`, so a re-pull is
+    /// served from disk (the reported dedup).
     Pull {
         /// Model reference, e.g. `mistral/mixtral-8x22b:v0.3.1`.
         target: String,
         /// Output directory. Defaults to a subdir of `cwd` named after the model.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// 32-byte ed25519 public key (hex). Required to verify the manifest.
+        /// 32-byte ed25519 public key (hex) to verify the manifest. Optional:
+        /// if omitted, the operator's key is resolved from the CDN's published
+        /// `.well-known/concord/keys.json` by the manifest's issuer.
         #[arg(long)]
-        pubkey: String,
+        pubkey: Option<String>,
         /// CDN base URL. The default targets the Concordfaces phase-0 EU
         /// operator; override for self-hosting or local tests. The
         /// operator's bucket prefix is wired into the CDN origin and is
@@ -175,27 +182,44 @@ async fn main() -> Result<()> {
         } => {
             let model = ModelRef::parse(&target)?;
             let out_dir = out.unwrap_or_else(|| PathBuf::from(model.name.replace('/', "_")));
-            let pk = parse_pubkey_hex(&pubkey).context("parse --pubkey")?;
             let cdn = concord_cli::cdn::CdnStore::new(cdn_endpoint)
                 .map_err(|e| anyhow!("build CDN store: {e}"))?;
-            let (manifest, stats) = pull::pull(
-                &cdn,
-                &PullArgs {
-                    name: model.name.clone(),
-                    version: model.version.clone(),
-                    out_dir: out_dir.clone(),
-                },
-                &pk,
-            )
-            .await?;
-            print_manifest_summary(&manifest);
+            let args = PullArgs {
+                name: model.name.clone(),
+                version: model.version.clone(),
+                out_dir: out_dir.clone(),
+            };
+
+            // Resolve the verifying key. With --pubkey we trust the operator
+            // supplied it out-of-band; without it we peek the (still
+            // unverified) manifest for its issuer, then look that issuer up in
+            // the operator's published keys. Either way the pull below
+            // re-fetches and cryptographically verifies before writing bytes.
+            let pk = match &pubkey {
+                Some(hex) => parse_pubkey_hex(hex).context("parse --pubkey")?,
+                None => resolve_pubkey_via_well_known(&cdn, &args).await?,
+            };
+
+            let progress = make_pull_progress();
+            let (_manifest, stats) =
+                pull::pull_with_progress(&cdn, &args, &pk, Some(progress)).await?;
+
             println!(
-                "\npulled {} files / {} bytes → {}",
-                stats.files,
-                stats.bytes,
-                out_dir.display()
+                "\n✓ {} · {} on the wire (dedup {:.1}%)",
+                human_bytes(stats.bytes),
+                human_bytes(stats.on_wire),
+                stats.dedup_pct(),
             );
-            println!("signature: OK");
+            println!(
+                "✓ residency: {} · {} files → {}",
+                if stats.residency.is_empty() {
+                    "unspecified"
+                } else {
+                    &stats.residency
+                },
+                stats.files,
+                out_dir.display(),
+            );
             Ok(())
         }
         Cmd::Push {
@@ -278,6 +302,98 @@ fn make_push_progress() -> ProgressFn {
         }
         ProgressEvent::Done => {
             pb_cb.finish_and_clear();
+        }
+    })
+}
+
+/// Resolve the operator verifying key from the CDN's published keys, using
+/// the issuer named in the (as-yet unverified) manifest. The manifest is
+/// re-fetched and verified by the pull itself, so reading the issuer here is
+/// just a routing hint — a forged issuer can only point at a key that won't
+/// verify the signature.
+async fn resolve_pubkey_via_well_known(
+    cdn: &concord_cli::cdn::CdnStore,
+    args: &PullArgs,
+) -> Result<ed25519_dalek::VerifyingKey> {
+    use concord_core::store::Store;
+    let raw = cdn
+        .get_manifest(&args.name, &args.version)
+        .await
+        .map_err(|e| anyhow!("fetch manifest {}:{}: {e}", args.name, args.version))?;
+    let manifest = Manifest::parse(&raw).context("parse manifest for issuer")?;
+    let issuer = &manifest.manifest.issuer;
+    eprintln!("resolving key for issuer {issuer:?} via .well-known/concord/keys.json");
+    let keys = cdn.fetch_well_known_keys().await.map_err(|e| {
+        anyhow!(
+            "fetch .well-known/concord/keys.json: {e} \
+            (pass --pubkey to verify against a key you already trust)"
+        )
+    })?;
+    resolve_issuer_key(&keys, issuer)
+}
+
+/// Build a [`PullProgress`] that renders a HuggingFace-style header and one
+/// live progress bar **per in-flight shard** (shards download concurrently),
+/// keyed by shard index in a `MultiProgress`. Bars + the MultiProgress live
+/// behind a mutex so the `Send + Sync` callback can mutate them from whichever
+/// task fires the event.
+fn make_pull_progress() -> PullProgress {
+    use indicatif::MultiProgress;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    let mp = MultiProgress::new();
+    let bars: Arc<Mutex<HashMap<usize, ProgressBar>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    Arc::new(move |ev: PullEvent| match ev {
+        PullEvent::Manifest {
+            issuer,
+            license,
+            residency,
+            shards,
+        } => {
+            let _ = mp.println(format!(
+                "issuer    {issuer}  · signed ed25519\nlicense   {license}  · residency={residency}\nshards    {shards}"
+            ));
+        }
+        PullEvent::ShardStart {
+            idx,
+            total,
+            role,
+            format,
+            size,
+            parts,
+        } => {
+            let pb = mp.add(ProgressBar::new(size));
+            let style = ProgressStyle::with_template(
+                "  {prefix} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}",
+            )
+            .expect("progress template")
+            .progress_chars("=>-");
+            pb.set_style(style);
+            pb.set_prefix(format!("[{idx}/{total}] {role}.{format}"));
+            if parts > 1 {
+                pb.set_message(format!("{parts} parts"));
+            }
+            bars.lock().unwrap().insert(idx, pb);
+        }
+        PullEvent::ChunkDone {
+            idx,
+            bytes,
+            cache_hit,
+        } => {
+            if let Some(pb) = bars.lock().unwrap().get(&idx) {
+                pb.inc(bytes);
+                if cache_hit {
+                    pb.set_message("cache-hit");
+                }
+            }
+        }
+        PullEvent::ShardDone { idx, filename } => {
+            if let Some(pb) = bars.lock().unwrap().remove(&idx) {
+                pb.finish_and_clear();
+            }
+            let _ = mp.println(format!("  [{idx}] {filename}  ✓"));
         }
     })
 }
