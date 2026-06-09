@@ -390,10 +390,21 @@ fn make_pull_progress() -> PullProgress {
             }
         }
         PullEvent::ShardDone { idx, filename } => {
-            if let Some(pb) = bars.lock().unwrap().remove(&idx) {
+            // Read the bar's transferred bytes + elapsed before clearing it,
+            // so we can report this shard's average speed on its done-line.
+            let avg = bars.lock().unwrap().remove(&idx).map(|pb| {
+                let r = concord_cli::fmt::rate(pb.position(), pb.elapsed().as_secs_f64());
                 pb.finish_and_clear();
+                r
+            });
+            match avg {
+                Some(speed) => {
+                    let _ = mp.println(format!("  [{idx}] {filename}  ✓  avg {speed}"));
+                }
+                None => {
+                    let _ = mp.println(format!("  [{idx}] {filename}  ✓"));
+                }
             }
-            let _ = mp.println(format!("  [{idx}] {filename}  ✓"));
         }
     })
 }
