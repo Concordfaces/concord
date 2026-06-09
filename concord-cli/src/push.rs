@@ -202,6 +202,22 @@ pub async fn push_with_progress<S: Store + ?Sized>(
         .await
         .map_err(|e| anyhow!("put manifest: {e}"))?;
 
+    // Maintain the moving `latest` pointer (`manifests/<name>/latest.toml`): a
+    // byte-identical copy of the manifest just pushed, so a bare
+    // `concord pull <name>` resolves to this release. Same signed bytes ⇒ the
+    // ed25519 signature still verifies (it covers content, not the object key).
+    // Skipped when the caller already pushed to the `latest` channel explicitly.
+    if args.version != crate::pull::DEFAULT_VERSION {
+        store
+            .put_manifest(
+                &args.name,
+                crate::pull::DEFAULT_VERSION,
+                Bytes::from(signed_bytes.clone()),
+            )
+            .await
+            .map_err(|e| anyhow!("put latest pointer: {e}"))?;
+    }
+
     if let Some(cb) = progress.as_ref() {
         cb(ProgressEvent::Done);
     }
@@ -443,15 +459,21 @@ mod tests {
             issued_at: Some("2026-05-26T00:00:00Z".into()),
         };
 
-        let (m, _bytes, stats) = push(&store, &args, &sk).await.unwrap();
+        let (m, bytes, stats) = push(&store, &args, &sk).await.unwrap();
         assert_eq!(m.shards.len(), 3);
         assert_eq!(stats.chunks_total, 3);
         assert_eq!(stats.chunks_uploaded, 3);
         assert_eq!(stats.chunks_skipped, 0);
         assert!(m.signature.is_some());
 
-        assert_eq!(store.manifest_count(), 1);
+        // Versioned manifest + the moving `latest` pointer.
+        assert_eq!(store.manifest_count(), 2);
         assert_eq!(store.chunk_count(), 3);
+        // The pointer is a byte-identical copy of the versioned manifest.
+        let versioned = store.get_manifest("test/tiny", "v0.1.0").await.unwrap();
+        let latest = store.get_manifest("test/tiny", "latest").await.unwrap();
+        assert_eq!(&versioned[..], &bytes[..]);
+        assert_eq!(versioned, latest);
     }
 
     #[tokio::test]

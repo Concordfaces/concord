@@ -23,8 +23,17 @@ pub struct PullArgs {
     pub out_dir: PathBuf,
 }
 
-/// Parsed model reference: `<name>:<version>`. A bare `<name>` is rejected
-/// (versioning channels — e.g. `latest` — are still an open RFC issue).
+/// Version channel a bare `<name>` resolves to. NOT a fixed version — `latest`
+/// is a moving pointer object (`manifests/<name>/latest.toml`) that the
+/// publisher rewrites to the newest manifest on every push. A bare
+/// `concord pull <name>` therefore always tracks the current release, while
+/// `<name>:<version>` pins an explicit one. The pointer is a public object on
+/// the same bucket/CDN as every other manifest, so resolution needs no API.
+pub const DEFAULT_VERSION: &str = "latest";
+
+/// Parsed model reference: `<name>[:<version>]`. A bare `<name>` resolves to
+/// the moving [`DEFAULT_VERSION`] pointer; an explicit `<name>:<version>` pins
+/// the channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelRef {
     pub name: String,
@@ -32,18 +41,27 @@ pub struct ModelRef {
 }
 
 impl ModelRef {
-    /// Parse `name:version`. Splits on the last `:` so `org/name:v1` works
-    /// and a name containing a `:` (it shouldn't, but) still parses
-    /// against the rightmost colon.
+    /// Parse `name[:version]`. Splits on the last `:` so `org/name:v1` works.
+    /// A bare `name` (no colon) resolves to [`DEFAULT_VERSION`]. A colon with
+    /// an empty side (`name:` or `:v1`) is malformed and rejected.
     pub fn parse(s: &str) -> Result<Self> {
+        let s = s.trim();
         match s.rsplit_once(':') {
+            // Explicit, fully-specified ref.
             Some((name, version)) if !name.is_empty() && !version.is_empty() => Ok(Self {
                 name: name.to_string(),
                 version: version.to_string(),
             }),
-            _ => bail!(
-                "ref must be `<name>:<version>` — bare names aren't supported (no version channels yet)"
+            // A colon was typed but one side is empty — malformed, not a default.
+            Some(_) => bail!(
+                "malformed ref `{s}` — use `<name>` or `<name>:<version>` (e.g. `org/model` or `org/model:v1`)"
             ),
+            // Bare name → default version channel.
+            None if !s.is_empty() => Ok(Self {
+                name: s.to_string(),
+                version: DEFAULT_VERSION.to_string(),
+            }),
+            None => bail!("empty model ref"),
         }
     }
 }
@@ -379,10 +397,19 @@ mod tests {
     }
 
     #[test]
-    fn modelref_requires_version() {
-        assert!(ModelRef::parse("only-name").is_err());
+    fn modelref_bare_name_defaults_to_latest() {
+        let r = ModelRef::parse("org/model").unwrap();
+        assert_eq!(r.name, "org/model");
+        assert_eq!(r.version, DEFAULT_VERSION);
+        assert_eq!(r.version, "latest");
+    }
+
+    #[test]
+    fn modelref_rejects_malformed_colon() {
+        // A typed colon with an empty side is malformed, NOT a default.
         assert!(ModelRef::parse("name:").is_err());
         assert!(ModelRef::parse(":v1").is_err());
+        assert!(ModelRef::parse("").is_err());
     }
 
     #[test]
