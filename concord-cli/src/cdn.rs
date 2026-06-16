@@ -60,7 +60,9 @@ pub struct RetryPolicy {
 impl RetryPolicy {
     pub fn from_env() -> Self {
         Self {
-            max_attempts: env_u64("CONCORD_MAX_RETRIES", 4).max(1) as u32,
+            // CONCORD_MAX_RETRIES is the number of RETRIES (extra attempts after
+            // the first); total attempts = retries + 1. Default 3 retries → 4 attempts.
+            max_attempts: env_u64("CONCORD_MAX_RETRIES", 3).saturating_add(1) as u32,
             base: Duration::from_millis(env_u64("CONCORD_RETRY_BASE_MS", 250)),
             http_timeout: Duration::from_secs(env_u64("CONCORD_HTTP_TIMEOUT_SECS", 60).max(1)),
         }
