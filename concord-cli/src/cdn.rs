@@ -62,7 +62,8 @@ impl RetryPolicy {
         Self {
             // CONCORD_MAX_RETRIES is the number of RETRIES (extra attempts after
             // the first); total attempts = retries + 1. Default 3 retries → 4 attempts.
-            max_attempts: env_u64("CONCORD_MAX_RETRIES", 3).saturating_add(1) as u32,
+            max_attempts: u32::try_from(env_u64("CONCORD_MAX_RETRIES", 3).saturating_add(1))
+                .unwrap_or(u32::MAX),
             base: Duration::from_millis(env_u64("CONCORD_RETRY_BASE_MS", 250)),
             http_timeout: Duration::from_secs(env_u64("CONCORD_HTTP_TIMEOUT_SECS", 60).max(1)),
         }
@@ -159,9 +160,13 @@ impl CdnStore {
     /// (so the origin's known zero-body hang trips a timeout → retry, instead
     /// of wedging the connection).
     async fn get_once(&self, url: &str) -> Attempt {
+        // reqwest's per-request timeout covers the ENTIRE exchange — connect,
+        // headers, AND body drain — so a stalled body read can't hang past it.
         let resp = match self.http.get(url).timeout(self.policy.http_timeout).send().await {
             Ok(r) => r,
-            // Connect/timeout/transport errors are transient — retry.
+            // Any .send() error (connect, timeout, TLS, DNS) is treated as
+            // transient. Non-recoverable cases (bad DNS/cert) will simply
+            // exhaust the bounded retries and surface — acceptable for a CLI.
             Err(e) => return Attempt::Transient(format!("http get {url}: {e}")),
         };
         let status = resp.status();
