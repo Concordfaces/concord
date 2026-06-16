@@ -275,14 +275,14 @@ async fn fetch_one_chunk<S: Store + ?Sized>(
 ) -> Result<(bytes::Bytes, bool)> {
     if let Some(p) = cache_path {
         if let Ok(b) = std::fs::read(p) {
-            if ChunkHash::of(&b).to_string() == h.to_string() {
+            if ChunkHash::of(&b) == *h {
                 return Ok((bytes::Bytes::from(b), true));
             }
         }
     }
     let b = store.get_chunk(h).await.map_err(|e| anyhow!("get chunk {h}: {e}"))?;
     let got = ChunkHash::of(&b);
-    if got.to_string() != h.to_string() {
+    if got != *h {
         bail!("chunk {h} content hash mismatch: got {got}");
     }
     if let Some(p) = cache_path {
@@ -411,6 +411,15 @@ async fn pull_shard<S: Store + ?Sized>(
         .truncate(false)
         .open(&paths.part_path)
         .with_context(|| format!("open {}", paths.part_path.display()))?;
+    // The durability invariant guarantees `.part` length >= bytes_done in the
+    // normal case. If it's SHORTER (e.g. a prior run renamed .part → final then
+    // crashed before writing the Complete marker, or .part was deleted), the
+    // committed prefix is gone — trusting bytes_done would zero-pad a fresh file
+    // and clobber a possibly-good final file. Restart this shard from scratch.
+    let actual_len = file.metadata().context("stat part")?.len();
+    if actual_len < marker.bytes_done {
+        marker = ResumeMarker::fresh(&shard.merkle);
+    }
     file.set_len(marker.bytes_done)
         .with_context(|| format!("truncate {} to {}", paths.part_path.display(), marker.bytes_done))?;
     file.seek(SeekFrom::End(0)).context("seek part to end")?;
@@ -418,13 +427,12 @@ async fn pull_shard<S: Store + ?Sized>(
     shard_start(marker.chunks_done, marker.bytes_done);
 
     let start = marker.chunks_done;
-    let remaining: Vec<(usize, ChunkHash)> =
-        chunk_hashes.iter().cloned().enumerate().skip(start).collect();
+    let remaining: Vec<ChunkHash> = chunk_hashes.iter().cloned().skip(start).collect();
 
     let concurrency = chunk_concurrency();
     let commit_n = commit_every();
 
-    let mut fetches = stream::iter(remaining.into_iter().map(|(_i, h)| {
+    let mut fetches = stream::iter(remaining.into_iter().map(|h| {
         let cache_path = cache_dir.map(|d| d.join(h.to_string()));
         async move { fetch_one_chunk(store, &h, cache_path.as_deref()).await }
     }))
@@ -464,7 +472,7 @@ async fn pull_shard<S: Store + ?Sized>(
     marker.save(&paths.marker_path)?;
 
     emit(PullEvent::ShardDone { idx, filename });
-    Ok((shard.size, on_wire))
+    Ok((marker.bytes_done, on_wire))
 }
 
 /// Map a shard back to a filename. role+format → `<role>.<format>`,
@@ -816,8 +824,6 @@ mod tests {
         assert_eq!(got, body, "cached reassembly matches original");
     }
 
-    use crate::resume::{ResumeMarker, ShardPaths, Status};
-
     async fn three_chunk_shard(
         store: &concord_core::store::MemoryStore,
     ) -> (Shard, Vec<Vec<u8>>) {
@@ -961,7 +967,6 @@ mod tests {
 
     #[tokio::test]
     async fn ordered_assembly_with_concurrency() {
-        std::env::set_var("CONCORD_CHUNK_CONCURRENCY", "4");
         let inner = concord_core::store::MemoryStore::new();
         let (shard, bodies) = three_chunk_shard(&inner).await;
         let store = CountingStore::new(inner);
@@ -971,6 +976,37 @@ mod tests {
         assert_eq!(written, 230);
         assert_eq!(std::fs::read(out.path().join("weights.bin")).unwrap(), bodies.concat(),
                    "buffered(C) preserves chunk order");
-        std::env::remove_var("CONCORD_CHUNK_CONCURRENCY");
+    }
+
+    #[tokio::test]
+    async fn stale_marker_with_missing_part_restarts_clean() {
+        // Simulates a crash after rename→final but before the Complete marker:
+        // the marker still says Partial/all-done, but .part no longer exists.
+        // The shard must restart cleanly and produce the REAL bytes, never a
+        // zero-padded file.
+        let inner = concord_core::store::MemoryStore::new();
+        let (shard, bodies) = three_chunk_shard(&inner).await;
+        let store = CountingStore::new(inner);
+        let out = tempfile::tempdir().unwrap();
+        let p = ShardPaths::new(out.path(), "weights.bin");
+        std::fs::create_dir_all(ShardPaths::state_dir(out.path())).unwrap();
+        // Marker claims everything done; NO .part file written.
+        ResumeMarker {
+            version: crate::resume::MARKER_VERSION,
+            merkle: shard.merkle.clone(),
+            chunks_done: 3,
+            bytes_done: 230,
+            status: Status::Partial,
+        }
+        .save(&p.marker_path)
+        .unwrap();
+        let (written, _wire) =
+            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        assert_eq!(written, 230);
+        assert_eq!(
+            std::fs::read(out.path().join("weights.bin")).unwrap(),
+            bodies.concat(),
+            "must not zero-pad; clean restart produces correct bytes"
+        );
     }
 }
