@@ -383,6 +383,10 @@ fn make_pull_progress() -> PullProgress {
             // Start the bar at what's already on disk so resume doesn't replay.
             pb.set_position(resumed_bytes);
             if resumed_chunks > 0 {
+                // Reset the rate/ETA clock so the resumed prefix (added to the
+                // bar in ~0s) isn't counted as throughput — otherwise the speed
+                // reads as an absurd spike (e.g. "2.74 TiB/s") on the first tick.
+                pb.reset_elapsed();
                 pb.set_message(format!(
                     "resumed {}",
                     concord_cli::fmt::human_bytes(resumed_bytes)
