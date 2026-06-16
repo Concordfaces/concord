@@ -31,6 +31,23 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use concord_core::chunker::ChunkHash;
 use concord_core::store::{Store, StoreError};
+use std::time::Duration;
+
+/// HTTP status codes worth retrying — transient server/overload signals.
+pub(crate) fn is_transient(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Exponential backoff: `base * 2^attempt` (0-based), capped at 30s. A zero
+/// base disables sleeping (used by tests to avoid real-time waits).
+pub(crate) fn backoff(attempt: u32, base: Duration) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let factor = 1u64 << attempt.min(6); // cap the shift so we never overflow
+    let ms = (base.as_millis() as u64).saturating_mul(factor);
+    Duration::from_millis(ms.min(30_000))
+}
 
 #[derive(Debug, Clone)]
 pub struct CdnStore {
@@ -185,5 +202,30 @@ mod tests {
         assert!(s.has_chunk(&h).await.is_err());
         assert!(s.put_chunk(&h, Bytes::new()).await.is_err());
         assert!(s.put_manifest("a", "b", Bytes::new()).await.is_err());
+    }
+
+    #[test]
+    fn is_transient_truth_table() {
+        for s in [408u16, 429, 500, 502, 503, 504] {
+            assert!(is_transient(s), "{s} should be transient");
+        }
+        for s in [200u16, 204, 301, 400, 403, 404, 410] {
+            assert!(!is_transient(s), "{s} should NOT be transient");
+        }
+    }
+
+    #[test]
+    fn backoff_is_monotonic_capped_and_zero_for_zero_base() {
+        use std::time::Duration;
+        assert_eq!(backoff(0, Duration::ZERO), Duration::ZERO);
+        let base = Duration::from_millis(250);
+        let b0 = backoff(0, base);
+        let b1 = backoff(1, base);
+        let b2 = backoff(2, base);
+        assert_eq!(b0, Duration::from_millis(250));
+        assert_eq!(b1, Duration::from_millis(500));
+        assert_eq!(b2, Duration::from_millis(1000));
+        assert!(b1 > b0 && b2 > b1, "backoff must grow");
+        assert!(backoff(20, base) <= Duration::from_millis(30_000));
     }
 }
