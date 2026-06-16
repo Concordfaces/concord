@@ -21,6 +21,9 @@ pub struct PullArgs {
     pub name: String,
     pub version: String,
     pub out_dir: PathBuf,
+    /// Ignore resume state + skip-done: re-fetch and rebuild every shard from
+    /// scratch (cache hits still re-verify). For when a local file is suspect.
+    pub reverify: bool,
 }
 
 /// Version channel a bare `<name>` resolves to. NOT a fixed version — `latest`
@@ -100,7 +103,9 @@ pub enum PullEvent {
         residency: String,
         shards: usize,
     },
-    /// Starting a shard (one output file).
+    /// Starting a shard (one output file). `resumed_chunks`/`resumed_bytes`
+    /// report how much was already on disk from a prior run (0 for a fresh
+    /// pull) so the renderer can start the bar at the right offset.
     ShardStart {
         idx: usize,
         total: usize,
@@ -108,6 +113,8 @@ pub enum PullEvent {
         format: String,
         size: u64,
         parts: usize,
+        resumed_chunks: usize,
+        resumed_bytes: u64,
     },
     /// A chunk finished — `cache_hit` = served from the local chunk cache
     /// (no wire bytes). `idx` is the 1-based shard number so a parallel
@@ -228,6 +235,8 @@ async fn download_shards<S: Store + ?Sized>(
                 format: shard.format.clone(),
                 size: shard.size,
                 parts: shard.parts.unwrap_or(1) as usize,
+                resumed_chunks: 0,
+                resumed_bytes: 0,
             });
             let (written, wire) = pull_shard(store, shard, out_dir, cache_dir, idx, emit).await?;
             emit(PullEvent::ShardDone {
