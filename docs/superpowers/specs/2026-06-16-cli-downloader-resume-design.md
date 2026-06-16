@@ -175,3 +175,17 @@ fetch-count assertions; use a temp dir for `.concord/` state.
 - Concurrent pulls into one out_dir (lockfile) — currently single-writer assumed.
 - Range/partial-byte resume *within* a single chunk (chunks are ≤4 MB; whole-chunk
   granularity is sufficient).
+- **Multi-shard filename collision (tracked, pre-existing).** `shard_filename`
+  maps every `*.safetensors` shard to `model.safetensors` (and same-extension aux
+  files collide too). For a model with multiple safetensors shards, the resume
+  layer's per-shard `.part` + `.json` marker — keyed off the output filename —
+  would be SHARED across colliding shards, and `download_shards` runs shards in
+  parallel → a concurrent multi-writer race on one `.part` (data corruption). This
+  is a pre-existing push/manifest limitation (the push side derives filenames the
+  same way) that the resume layer amplifies from benign last-writer-wins to
+  corruption. Current phase-0 targets are single-file, so this is not yet hit.
+  Fix before serving sharded models: key `.part`/marker on shard role+index (not
+  the output filename), or disambiguate the output filenames at push time.
+- **`CONCORD_COMMIT_EVERY > 1` is untested.** The batched-marker path and its
+  "re-fetch at most K-1 chunks after a crash" guarantee have no test; add one
+  before relying on K>1 in production.
