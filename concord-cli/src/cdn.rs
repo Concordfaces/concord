@@ -49,6 +49,60 @@ pub(crate) fn backoff(attempt: u32, base: Duration) -> Duration {
     Duration::from_millis(ms.min(30_000))
 }
 
+/// Retry/timeout policy for CDN fetches. Built from env with sane defaults.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub base: Duration,
+    pub http_timeout: Duration,
+}
+
+impl RetryPolicy {
+    pub fn from_env() -> Self {
+        Self {
+            max_attempts: env_u64("CONCORD_MAX_RETRIES", 4).max(1) as u32,
+            base: Duration::from_millis(env_u64("CONCORD_RETRY_BASE_MS", 250)),
+            http_timeout: Duration::from_secs(env_u64("CONCORD_HTTP_TIMEOUT_SECS", 60).max(1)),
+        }
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Outcome of one fetch attempt, classified for the retry loop.
+pub(crate) enum Attempt {
+    Ok(Bytes),
+    NotFound,
+    Transient(String),
+    Permanent(String),
+}
+
+/// Drive `op` until it succeeds, hits a terminal outcome, or exhausts attempts.
+/// Sleeps `backoff(attempt, base)` between transient failures.
+pub(crate) async fn retry<F, Fut>(mut op: F, policy: &RetryPolicy) -> Result<Bytes, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Attempt>,
+{
+    let mut last = String::new();
+    for attempt in 0..policy.max_attempts {
+        match op().await {
+            Attempt::Ok(b) => return Ok(b),
+            Attempt::NotFound => return Err(StoreError::NotFound),
+            Attempt::Permanent(m) => return Err(StoreError::Backend(m)),
+            Attempt::Transient(m) => {
+                last = m;
+                if attempt + 1 < policy.max_attempts {
+                    tokio::time::sleep(backoff(attempt, policy.base)).await;
+                }
+            }
+        }
+    }
+    Err(StoreError::Backend(format!("exhausted retries: {last}")))
+}
+
 #[derive(Debug, Clone)]
 pub struct CdnStore {
     /// e.g. `https://chunks.eu.concordfaces.org`. No trailing slash.
@@ -227,5 +281,66 @@ mod tests {
         assert_eq!(b2, Duration::from_millis(1000));
         assert!(b1 > b0 && b2 > b1, "backoff must grow");
         assert!(backoff(20, base) <= Duration::from_millis(30_000));
+    }
+
+    fn no_sleep_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base: std::time::Duration::ZERO,
+            http_timeout: std::time::Duration::from_secs(60),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_transient_failures() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let op = || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n < 3 {
+                    Attempt::Transient(format!("boom {n}"))
+                } else {
+                    Attempt::Ok(Bytes::from_static(b"ok"))
+                }
+            }
+        };
+        let out = retry(op, &no_sleep_policy(5)).await.unwrap();
+        assert_eq!(out.as_ref(), b"ok");
+        assert_eq!(calls.get(), 3, "two failures then success");
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_max_attempts() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let op = || {
+            calls.set(calls.get() + 1);
+            async { Attempt::Transient("always".into()) }
+        };
+        let err = retry(op, &no_sleep_policy(3)).await.unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)));
+        assert_eq!(calls.get(), 3, "exactly max_attempts tries");
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_retry_not_found_or_permanent() {
+        use std::cell::Cell;
+        let nf_calls = Cell::new(0u32);
+        let nf = || {
+            nf_calls.set(nf_calls.get() + 1);
+            async { Attempt::NotFound }
+        };
+        assert!(matches!(retry(nf, &no_sleep_policy(5)).await, Err(StoreError::NotFound)));
+        assert_eq!(nf_calls.get(), 1, "NotFound is terminal — no retry");
+
+        let p_calls = Cell::new(0u32);
+        let p = || {
+            p_calls.set(p_calls.get() + 1);
+            async { Attempt::Permanent("403".into()) }
+        };
+        assert!(matches!(retry(p, &no_sleep_policy(5)).await, Err(StoreError::Backend(_))));
+        assert_eq!(p_calls.get(), 1, "permanent is terminal — no retry");
     }
 }
