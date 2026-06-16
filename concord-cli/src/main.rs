@@ -64,6 +64,10 @@ enum Cmd {
             default_value = "https://chunks.eu.concordfaces.org"
         )]
         cdn_endpoint: String,
+        /// Re-fetch and rebuild every shard from scratch, ignoring resume
+        /// state and skip-done. Use if a local file is suspected corrupt.
+        #[arg(long)]
+        reverify: bool,
     },
     /// Push a model version to an operator.
     Push {
@@ -179,6 +183,7 @@ async fn main() -> Result<()> {
             out,
             pubkey,
             cdn_endpoint,
+            reverify,
         } => {
             let model = ModelRef::parse(&target)?;
             let out_dir = out.unwrap_or_else(|| PathBuf::from(model.name.replace('/', "_")));
@@ -188,6 +193,7 @@ async fn main() -> Result<()> {
                 name: model.name.clone(),
                 version: model.version.clone(),
                 out_dir: out_dir.clone(),
+                reverify,
             };
 
             // Resolve the verifying key. With --pubkey we trust the operator
@@ -343,7 +349,7 @@ fn make_pull_progress() -> PullProgress {
     use std::sync::Mutex;
 
     let mp = MultiProgress::new();
-    let bars: Arc<Mutex<HashMap<usize, ProgressBar>>> = Arc::new(Mutex::new(HashMap::new()));
+    let bars: Arc<Mutex<HashMap<usize, (ProgressBar, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
 
     Arc::new(move |ev: PullEvent| match ev {
         PullEvent::Manifest {
@@ -363,6 +369,8 @@ fn make_pull_progress() -> PullProgress {
             format,
             size,
             parts,
+            resumed_chunks,
+            resumed_bytes,
         } => {
             let pb = mp.add(ProgressBar::new(size));
             let style = ProgressStyle::with_template(
@@ -372,17 +380,21 @@ fn make_pull_progress() -> PullProgress {
             .progress_chars("=>-");
             pb.set_style(style);
             pb.set_prefix(format!("[{idx}/{total}] {role}.{format}"));
-            if parts > 1 {
+            // Start the bar at what's already on disk so resume doesn't replay.
+            pb.set_position(resumed_bytes);
+            if resumed_chunks > 0 {
+                pb.set_message(format!("resumed {}", concord_cli::fmt::human_bytes(resumed_bytes)));
+            } else if parts > 1 {
                 pb.set_message(format!("{parts} parts"));
             }
-            bars.lock().unwrap().insert(idx, pb);
+            bars.lock().unwrap().insert(idx, (pb, resumed_bytes));
         }
         PullEvent::ChunkDone {
             idx,
             bytes,
             cache_hit,
         } => {
-            if let Some(pb) = bars.lock().unwrap().get(&idx) {
+            if let Some((pb, _resumed)) = bars.lock().unwrap().get(&idx) {
                 pb.inc(bytes);
                 if cache_hit {
                     pb.set_message("cache-hit");
@@ -390,10 +402,9 @@ fn make_pull_progress() -> PullProgress {
             }
         }
         PullEvent::ShardDone { idx, filename } => {
-            // Read the bar's transferred bytes + elapsed before clearing it,
-            // so we can report this shard's average speed on its done-line.
-            let avg = bars.lock().unwrap().remove(&idx).map(|pb| {
-                let r = concord_cli::fmt::rate(pb.position(), pb.elapsed().as_secs_f64());
+            let avg = bars.lock().unwrap().remove(&idx).map(|(pb, resumed)| {
+                let transferred = pb.position().saturating_sub(resumed);
+                let r = concord_cli::fmt::rate(transferred, pb.elapsed().as_secs_f64());
                 pb.finish_and_clear();
                 r
             });

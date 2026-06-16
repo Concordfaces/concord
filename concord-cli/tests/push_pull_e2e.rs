@@ -64,6 +64,7 @@ async fn push_then_pull_roundtrip_preserves_bytes() {
         name: "concord/e2e-model".into(),
         version: "v1.0.0".into(),
         out_dir: dst.path().to_path_buf(),
+        reverify: false,
     };
     let (pulled_manifest, pull_stats) = pull(&store, &pull_args, &vk).await.unwrap();
 
@@ -122,6 +123,7 @@ async fn pull_rejects_wrong_pubkey() {
             name: "concord/wrong-key".into(),
             version: "v1".into(),
             out_dir: dst.path().to_path_buf(),
+            reverify: false,
         },
         &other_vk,
     )
