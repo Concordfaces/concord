@@ -158,6 +158,9 @@ pub async fn push_with_progress<S: Store + ?Sized>(
         shards.push(Shard {
             role: plan.role.to_string(),
             format: plan.format,
+            // Carry the real source-relative filename so pull reconstructs the
+            // exact layout — role+format alone collides (e.g. many aux/json).
+            path: Some(plan.relpath.clone()),
             parts: Some(refs.len() as u32),
             size,
             merkle: merkle.to_string(),

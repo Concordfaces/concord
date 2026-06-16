@@ -366,8 +366,12 @@ async fn pull_shard<S: Store + ?Sized>(
     use futures::stream::{self, StreamExt};
 
     let chunk_hashes = resolve_chunk_hashes(shard)?;
-    let filename = shard_filename(shard);
-    let paths = ShardPaths::new(out_dir, &filename);
+    let filename = shard_output_name(shard);
+    // Key the transient .part/marker on the shard INDEX, not the filename, so
+    // two shards that resolve to the same output name (legacy manifests with no
+    // `path`) never share a .part and race on rename. The final file still uses
+    // the resolved name.
+    let paths = ShardPaths::new(out_dir, idx, &filename);
 
     let shard_start = |resumed_chunks: usize, resumed_bytes: u64| {
         emit(PullEvent::ShardStart {
@@ -397,6 +401,12 @@ async fn pull_shard<S: Store + ?Sized>(
 
     std::fs::create_dir_all(ShardPaths::state_dir(out_dir))
         .with_context(|| format!("mkdir {}", ShardPaths::state_dir(out_dir).display()))?;
+
+    // The resolved name may carry subdirectories (e.g. `subdir/weights.bin`);
+    // ensure the final file's parent exists before the rename.
+    if let Some(parent) = paths.final_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
 
     // Resume point: a partial marker with the SAME merkle, else fresh.
     let mut marker = if reverify {
@@ -491,6 +501,36 @@ async fn pull_shard<S: Store + ?Sized>(
     Ok((marker.bytes_done, on_wire))
 }
 
+/// The output path (relative to out_dir) for a shard. Prefers the manifest's
+/// real `path` (the exact source layout); falls back to a `role.format` name
+/// for legacy manifests that predate the `path` field. The path is sanitized
+/// to a safe relative path so a manifest can never escape out_dir.
+fn shard_output_name(shard: &Shard) -> String {
+    if let Some(p) = &shard.path {
+        let safe = sanitize_rel_path(p);
+        if !safe.is_empty() {
+            return safe;
+        }
+    }
+    shard_filename(shard)
+}
+
+/// Reduce a path to its safe `Normal` components joined by `/` — drops leading
+/// `/`, `..`, `.`, and any drive/root prefix. Guards against path traversal: a
+/// manifest `path` like `../../etc/x` or `/etc/x` can only ever write inside
+/// out_dir.
+fn sanitize_rel_path(p: &str) -> String {
+    use std::path::Component;
+    Path::new(p)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(os) => os.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Map a shard back to a filename. role+format → `<role>.<format>`,
 /// except for tokenizer/format=tokenizers.json which maps to
 /// `tokenizer.json` and config/json which maps to `config.json` to match
@@ -536,6 +576,7 @@ mod tests {
         let mk = |role: &str, fmt: &str| Shard {
             role: role.into(),
             format: fmt.into(),
+            path: None,
             parts: None,
             size: 0,
             merkle: String::new(),
@@ -571,6 +612,7 @@ mod tests {
         let shard = Shard {
             role: "weights".into(),
             format: "bin".into(),
+            path: None,
             parts: Some(3),
             size: 230,
             merkle: merkle.to_string(),
@@ -599,6 +641,7 @@ mod tests {
         let shard = Shard {
             role: "weights".into(),
             format: "bin".into(),
+            path: None,
             parts: Some(2),
             size: 20,
             merkle: "b3:0000000000000000000000000000000000000000000000000000000000000000".into(),
@@ -757,6 +800,7 @@ mod tests {
             shards.push(Shard {
                 role: format!("w{i}"),
                 format: "bin".into(),
+                path: None,
                 parts: Some(1),
                 size: body.len() as u64,
                 merkle: shard_merkle(std::slice::from_ref(&h)).to_string(),
@@ -810,6 +854,7 @@ mod tests {
         let shard = Shard {
             role: "weights".into(),
             format: "bin".into(),
+            path: None,
             parts: Some(1),
             size: 256,
             merkle: merkle.to_string(),
@@ -874,6 +919,7 @@ mod tests {
         let shard = Shard {
             role: "weights".into(),
             format: "bin".into(),
+            path: None,
             parts: Some(3),
             size: 230,
             merkle: shard_merkle(&hashes).to_string(),
@@ -895,7 +941,7 @@ mod tests {
         assert_eq!(store.gets(), 3);
         let got = std::fs::read(out.path().join("weights.bin")).unwrap();
         assert_eq!(got, bodies.concat());
-        let p = ShardPaths::new(out.path(), "weights.bin");
+        let p = ShardPaths::new(out.path(), 1, "weights.bin");
         assert_eq!(
             ResumeMarker::load(&p.marker_path).unwrap().status,
             Status::Complete
@@ -925,7 +971,7 @@ mod tests {
         let (shard, bodies) = three_chunk_shard(&inner).await;
         let store = CountingStore::new(inner);
         let out = tempfile::tempdir().unwrap();
-        let p = ShardPaths::new(out.path(), "weights.bin");
+        let p = ShardPaths::new(out.path(), 1, "weights.bin");
         std::fs::create_dir_all(ShardPaths::state_dir(out.path())).unwrap();
         std::fs::write(&p.part_path, &bodies[0]).unwrap();
         ResumeMarker {
@@ -959,7 +1005,7 @@ mod tests {
         let (shard, bodies) = three_chunk_shard(&inner).await;
         let store = CountingStore::new(inner);
         let out = tempfile::tempdir().unwrap();
-        let p = ShardPaths::new(out.path(), "weights.bin");
+        let p = ShardPaths::new(out.path(), 1, "weights.bin");
         std::fs::create_dir_all(ShardPaths::state_dir(out.path())).unwrap();
         std::fs::write(&p.part_path, b"garbage from another version").unwrap();
         ResumeMarker {
@@ -988,7 +1034,7 @@ mod tests {
         let (shard, bodies) = three_chunk_shard(&inner).await;
         let store = CountingStore::new(inner);
         let out = tempfile::tempdir().unwrap();
-        let p = ShardPaths::new(out.path(), "weights.bin");
+        let p = ShardPaths::new(out.path(), 1, "weights.bin");
         std::fs::create_dir_all(ShardPaths::state_dir(out.path())).unwrap();
         let mut torn = bodies[0].clone();
         torn.extend_from_slice(b"torn-partial-write");
@@ -1056,7 +1102,7 @@ mod tests {
         let (shard, bodies) = three_chunk_shard(&inner).await;
         let store = CountingStore::new(inner);
         let out = tempfile::tempdir().unwrap();
-        let p = ShardPaths::new(out.path(), "weights.bin");
+        let p = ShardPaths::new(out.path(), 1, "weights.bin");
         std::fs::create_dir_all(ShardPaths::state_dir(out.path())).unwrap();
         // Marker claims everything done; NO .part file written.
         ResumeMarker {
@@ -1076,6 +1122,109 @@ mod tests {
             std::fs::read(out.path().join("weights.bin")).unwrap(),
             bodies.concat(),
             "must not zero-pad; clean restart produces correct bytes"
+        );
+    }
+
+    #[test]
+    fn sanitize_rel_path_strips_traversal() {
+        assert_eq!(sanitize_rel_path("../../etc/passwd"), "etc/passwd");
+        assert_eq!(sanitize_rel_path("/abs/x.json"), "abs/x.json");
+        assert_eq!(sanitize_rel_path("sub/dir/file.json"), "sub/dir/file.json");
+        assert_eq!(sanitize_rel_path("./a/./b"), "a/b");
+    }
+
+    #[test]
+    fn shard_output_name_prefers_path_else_role_format() {
+        let with_path = Shard {
+            role: "aux".into(),
+            format: "json".into(),
+            path: Some("generation_config.json".into()),
+            parts: Some(1),
+            size: 1,
+            merkle: String::new(),
+            chunks: vec![],
+        };
+        assert_eq!(shard_output_name(&with_path), "generation_config.json");
+        let legacy = Shard {
+            role: "config".into(),
+            format: "json".into(),
+            path: None,
+            parts: Some(1),
+            size: 1,
+            merkle: String::new(),
+            chunks: vec![],
+        };
+        assert_eq!(shard_output_name(&legacy), "config.json");
+    }
+
+    /// Two shards with the SAME (role, format) — which `shard_filename` would
+    /// collide onto one name — but distinct `path` write to distinct files with
+    /// no rename race/error (the bug that made gpt2/phi-2 unpullable).
+    #[tokio::test]
+    async fn colliding_role_format_writes_distinct_files_via_path() {
+        let store = concord_core::store::MemoryStore::new();
+        let b1 = vec![1u8; 40];
+        let b2 = vec![2u8; 50];
+        let h1 = ChunkHash::of(b1.as_slice());
+        let h2 = ChunkHash::of(b2.as_slice());
+        store
+            .put_chunk(&h1, bytes::Bytes::from(b1.clone()))
+            .await
+            .unwrap();
+        store
+            .put_chunk(&h2, bytes::Bytes::from(b2.clone()))
+            .await
+            .unwrap();
+        let mk = |path: &str, sz: u64, h: &ChunkHash| Shard {
+            role: "aux".into(),
+            format: "json".into(),
+            path: Some(path.into()),
+            parts: Some(1),
+            size: sz,
+            merkle: shard_merkle(std::slice::from_ref(h)).to_string(),
+            chunks: vec![h.to_string()],
+        };
+        let s1 = mk("config.json", 40, &h1);
+        let s2 = mk("generation_config.json", 50, &h2);
+        let out = tempfile::tempdir().unwrap();
+        pull_shard(&store, &s1, out.path(), None, 1, 2, false, &|_| {})
+            .await
+            .unwrap();
+        pull_shard(&store, &s2, out.path(), None, 2, 2, false, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(out.path().join("config.json")).unwrap(), b1);
+        assert_eq!(
+            std::fs::read(out.path().join("generation_config.json")).unwrap(),
+            b2
+        );
+    }
+
+    #[tokio::test]
+    async fn path_with_subdir_creates_parent() {
+        let store = concord_core::store::MemoryStore::new();
+        let body = vec![7u8; 64];
+        let h = ChunkHash::of(body.as_slice());
+        store
+            .put_chunk(&h, bytes::Bytes::from(body.clone()))
+            .await
+            .unwrap();
+        let s = Shard {
+            role: "weights".into(),
+            format: "safetensors".into(),
+            path: Some("nested/dir/model.safetensors".into()),
+            parts: Some(1),
+            size: 64,
+            merkle: shard_merkle(std::slice::from_ref(&h)).to_string(),
+            chunks: vec![h.to_string()],
+        };
+        let out = tempfile::tempdir().unwrap();
+        pull_shard(&store, &s, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("nested/dir/model.safetensors")).unwrap(),
+            body
         );
     }
 }

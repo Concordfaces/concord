@@ -114,6 +114,7 @@ mod tests {
             shards: vec![Shard {
                 role: "weights".into(),
                 format: "safetensors".into(),
+                path: None,
                 parts: None,
                 size: 1234,
                 merkle: "b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
