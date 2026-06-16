@@ -34,6 +34,7 @@ fn sample() -> Manifest {
         shards: vec![Shard {
             role: "weights".into(),
             format: "safetensors".into(),
+            path: None,
             parts: Some(1),
             size: 4096,
             merkle: "b3:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),

@@ -58,6 +58,13 @@ pub struct Shard {
     /// `weights|tokenizer|config|adapter|quant|aux`
     pub role: String,
     pub format: String,
+    /// Original source-relative path/filename (e.g. `tokenizer_config.json`,
+    /// `subdir/weights.bin`). Restores the real layout that `role`+`format`
+    /// cannot uniquely encode — without it, files sharing a (role, format)
+    /// collide on one output name. Optional for backward compat: legacy
+    /// manifests omit it and the puller falls back to a `role.format` name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parts: Option<u32>,
     pub size: u64,
@@ -306,6 +313,7 @@ mod tests {
                 Shard {
                     role: "weights".into(),
                     format: "safetensors".into(),
+                    path: None,
                     parts: Some(56),
                     size: 90_172_948_480,
                     merkle: "b3:7a4e9c2f9b1d0000000000000000000000000000000000000000000000000000"
@@ -315,6 +323,7 @@ mod tests {
                 Shard {
                     role: "tokenizer".into(),
                     format: "tokenizers.json".into(),
+                    path: None,
                     parts: None,
                     size: 2_412_904,
                     merkle: "b3:88a0f0e1000000000000000000000000000000000000000000000000000000000"

@@ -90,13 +90,16 @@ pub struct ShardPaths {
 }
 
 impl ShardPaths {
-    /// Compute the final, .part, and marker paths for `filename` under `out_dir`.
-    pub fn new(out_dir: &Path, filename: &str) -> Self {
+    /// Compute the final output path (`<out_dir>/<output_name>`) plus the
+    /// transient `.part`/marker paths under `<out_dir>/.concord/`. The transient
+    /// files are keyed on the shard INDEX (not the output name) so two shards
+    /// resolving to the same output name never collide on a `.part`.
+    pub fn new(out_dir: &Path, idx: usize, output_name: &str) -> Self {
         let state = out_dir.join(STATE_DIR);
         Self {
-            final_path: out_dir.join(filename),
-            part_path: state.join(format!("{filename}.part")),
-            marker_path: state.join(format!("{filename}.json")),
+            final_path: out_dir.join(output_name),
+            part_path: state.join(format!("{idx}.part")),
+            marker_path: state.join(format!("{idx}.json")),
         }
     }
 
@@ -112,16 +115,15 @@ mod tests {
 
     #[test]
     fn shard_paths_layout() {
-        let p = ShardPaths::new(std::path::Path::new("/out"), "model.safetensors");
-        assert_eq!(p.final_path, std::path::Path::new("/out/model.safetensors"));
+        let p = ShardPaths::new(std::path::Path::new("/out"), 3, "tok/tokenizer.json");
         assert_eq!(
-            p.part_path,
-            std::path::Path::new("/out/.concord/model.safetensors.part")
+            p.final_path,
+            std::path::Path::new("/out/tok/tokenizer.json")
         );
-        assert_eq!(
-            p.marker_path,
-            std::path::Path::new("/out/.concord/model.safetensors.json")
-        );
+        // Transient files keyed on the shard index, not the (possibly colliding)
+        // output name.
+        assert_eq!(p.part_path, std::path::Path::new("/out/.concord/3.part"));
+        assert_eq!(p.marker_path, std::path::Path::new("/out/.concord/3.json"));
     }
 
     #[test]
