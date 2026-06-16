@@ -212,13 +212,17 @@ fn download_concurrency() -> usize {
 }
 
 /// Intra-shard chunk look-ahead. Chunks are fetched up to this many at once
-/// (ordered commit), pipelining the network. `CONCORD_CHUNK_CONCURRENCY`; default 4.
+/// (ordered commit), pipelining the network. With the HTTP/1.1 store client each
+/// in-flight chunk is its own TCP connection, so this is effectively the number
+/// of parallel connections per file — the main throughput dial. 16 reaches
+/// ~60 MB/s to the CDN edge for a single large file (a 4.65 GB model);
+/// `CONCORD_CHUNK_CONCURRENCY` overrides (32 ≈ 160 MB/s if the link allows).
 fn chunk_concurrency() -> usize {
     std::env::var("CONCORD_CHUNK_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(4)
+        .unwrap_or(16)
 }
 
 /// Chunks committed before fsync+marker advance. 1 = safest. `CONCORD_COMMIT_EVERY`; default 1.

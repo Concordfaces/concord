@@ -71,7 +71,18 @@ impl S3Store {
         };
         let scheme = url.scheme();
         let endpoint_origin = format!("{scheme}://{endpoint_host}");
-        let http = Client::builder().build()?;
+        // HuggingFace-level throughput: force HTTP/1.1 so each concurrent chunk
+        // fetch gets its OWN TCP connection. With the default (HTTP/2 negotiated
+        // via ALPN) reqwest multiplexes EVERY concurrent request over a single
+        // connection, capping the whole download at one connection's throughput
+        // (~14 MB/s through the CDN). N real HTTP/1.1 connections scale almost
+        // linearly to the same edge — measured 62 MB/s at 16 and 164 MB/s at 32
+        // connections — which is what gets pulls to HuggingFace speeds. The pool
+        // keeps idle connections hot so sustained multi-chunk fetches reuse them.
+        let http = Client::builder()
+            .http1_only()
+            .pool_max_idle_per_host(64)
+            .build()?;
         Ok(Self {
             cfg,
             http,
