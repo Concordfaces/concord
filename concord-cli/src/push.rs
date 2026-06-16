@@ -316,7 +316,7 @@ async fn upload_chunks<S: Store + ?Sized>(
     // `&store` is shared across the in-flight futures (no Arc / no spawn —
     // the stream is driven within this fn, so borrows of `refs`/`progress`
     // are sound). Content-addressed PUT-always means order doesn't matter.
-    let uploaded: Vec<u64> = futures::stream::iter(refs.iter().zip(bodies.into_iter()))
+    let uploaded: Vec<u64> = futures::stream::iter(refs.iter().zip(bodies))
         .map(|(cref, body)| {
             let len = cref.len as u64;
             async move {

@@ -10,3 +10,4 @@ pub mod fmt;
 pub mod key;
 pub mod pull;
 pub mod push;
+pub mod resume;

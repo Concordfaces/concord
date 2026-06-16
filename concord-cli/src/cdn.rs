@@ -31,6 +31,83 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use concord_core::chunker::ChunkHash;
 use concord_core::store::{Store, StoreError};
+use std::time::Duration;
+
+/// HTTP status codes worth retrying — transient server/overload signals.
+pub(crate) fn is_transient(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Exponential backoff: `base * 2^attempt` (0-based), capped at 30s. A zero
+/// base disables sleeping (used by tests to avoid real-time waits).
+pub(crate) fn backoff(attempt: u32, base: Duration) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let factor = 1u64 << attempt.min(6); // cap the shift so we never overflow
+    let ms = (base.as_millis() as u64).saturating_mul(factor);
+    Duration::from_millis(ms.min(30_000))
+}
+
+/// Retry/timeout policy for CDN fetches. Built from env with sane defaults.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub base: Duration,
+    pub http_timeout: Duration,
+}
+
+impl RetryPolicy {
+    pub fn from_env() -> Self {
+        Self {
+            // CONCORD_MAX_RETRIES is the number of RETRIES (extra attempts after
+            // the first); total attempts = retries + 1. Default 3 retries → 4 attempts.
+            max_attempts: u32::try_from(env_u64("CONCORD_MAX_RETRIES", 3).saturating_add(1))
+                .unwrap_or(u32::MAX),
+            base: Duration::from_millis(env_u64("CONCORD_RETRY_BASE_MS", 250)),
+            http_timeout: Duration::from_secs(env_u64("CONCORD_HTTP_TIMEOUT_SECS", 60).max(1)),
+        }
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Outcome of one fetch attempt, classified for the retry loop.
+pub(crate) enum Attempt {
+    Ok(Bytes),
+    NotFound,
+    Transient(String),
+    Permanent(String),
+}
+
+/// Drive `op` until it succeeds, hits a terminal outcome, or exhausts attempts.
+/// Sleeps `backoff(attempt, base)` between transient failures.
+pub(crate) async fn retry<F, Fut>(mut op: F, policy: &RetryPolicy) -> Result<Bytes, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Attempt>,
+{
+    let mut last = String::new();
+    for attempt in 0..policy.max_attempts {
+        match op().await {
+            Attempt::Ok(b) => return Ok(b),
+            Attempt::NotFound => return Err(StoreError::NotFound),
+            Attempt::Permanent(m) => return Err(StoreError::Backend(m)),
+            Attempt::Transient(m) => {
+                last = m;
+                if attempt + 1 < policy.max_attempts {
+                    tokio::time::sleep(backoff(attempt, policy.base)).await;
+                }
+            }
+        }
+    }
+    Err(StoreError::Backend(format!("exhausted retries: {last}")))
+}
 
 #[derive(Debug, Clone)]
 pub struct CdnStore {
@@ -43,6 +120,7 @@ pub struct CdnStore {
     /// by passing a different bucket name.
     base: String,
     http: reqwest::Client,
+    policy: RetryPolicy,
 }
 
 impl CdnStore {
@@ -58,6 +136,7 @@ impl CdnStore {
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             http,
+            policy: RetryPolicy::from_env(),
         })
     }
 
@@ -80,21 +159,43 @@ impl CdnStore {
         self.fetch(&self.keys_url()).await
     }
 
-    async fn fetch(&self, url: &str) -> Result<Bytes, StoreError> {
-        let resp = self
+    /// One GET attempt, classified for the retry loop. A per-request timeout
+    /// (so the origin's known zero-body hang trips a timeout → retry, instead
+    /// of wedging the connection).
+    async fn get_once(&self, url: &str) -> Attempt {
+        // reqwest's per-request timeout covers the ENTIRE exchange — connect,
+        // headers, AND body drain — so a stalled body read can't hang past it.
+        let resp = match self
             .http
             .get(url)
+            .timeout(self.policy.http_timeout)
             .send()
             .await
-            .map_err(|e| StoreError::Backend(format!("http get {url}: {e}")))?;
-        match resp.status() {
-            s if s.is_success() => resp
-                .bytes()
-                .await
-                .map_err(|e| StoreError::Backend(format!("read body {url}: {e}"))),
-            reqwest::StatusCode::NOT_FOUND => Err(StoreError::NotFound),
-            other => Err(StoreError::Backend(format!("HTTP {other} from {url}"))),
+        {
+            Ok(r) => r,
+            // Any .send() error (connect, timeout, TLS, DNS) is treated as
+            // transient. Non-recoverable cases (bad DNS/cert) will simply
+            // exhaust the bounded retries and surface — acceptable for a CLI.
+            Err(e) => return Attempt::Transient(format!("http get {url}: {e}")),
+        };
+        let status = resp.status();
+        if status.is_success() {
+            return match resp.bytes().await {
+                Ok(b) => Attempt::Ok(b),
+                Err(e) => Attempt::Transient(format!("read body {url}: {e}")),
+            };
         }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Attempt::NotFound;
+        }
+        if is_transient(status.as_u16()) {
+            return Attempt::Transient(format!("HTTP {status} from {url}"));
+        }
+        Attempt::Permanent(format!("HTTP {status} from {url}"))
+    }
+
+    async fn fetch(&self, url: &str) -> Result<Bytes, StoreError> {
+        retry(|| self.get_once(url), &self.policy).await
     }
 }
 
@@ -185,5 +286,97 @@ mod tests {
         assert!(s.has_chunk(&h).await.is_err());
         assert!(s.put_chunk(&h, Bytes::new()).await.is_err());
         assert!(s.put_manifest("a", "b", Bytes::new()).await.is_err());
+    }
+
+    #[test]
+    fn is_transient_truth_table() {
+        for s in [408u16, 429, 500, 502, 503, 504] {
+            assert!(is_transient(s), "{s} should be transient");
+        }
+        for s in [200u16, 204, 301, 400, 403, 404, 410] {
+            assert!(!is_transient(s), "{s} should NOT be transient");
+        }
+    }
+
+    #[test]
+    fn backoff_is_monotonic_capped_and_zero_for_zero_base() {
+        use std::time::Duration;
+        assert_eq!(backoff(0, Duration::ZERO), Duration::ZERO);
+        let base = Duration::from_millis(250);
+        let b0 = backoff(0, base);
+        let b1 = backoff(1, base);
+        let b2 = backoff(2, base);
+        assert_eq!(b0, Duration::from_millis(250));
+        assert_eq!(b1, Duration::from_millis(500));
+        assert_eq!(b2, Duration::from_millis(1000));
+        assert!(b1 > b0 && b2 > b1, "backoff must grow");
+        assert!(backoff(20, base) <= Duration::from_millis(30_000));
+    }
+
+    fn no_sleep_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base: std::time::Duration::ZERO,
+            http_timeout: std::time::Duration::from_secs(60),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_transient_failures() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let op = || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n < 3 {
+                    Attempt::Transient(format!("boom {n}"))
+                } else {
+                    Attempt::Ok(Bytes::from_static(b"ok"))
+                }
+            }
+        };
+        let out = retry(op, &no_sleep_policy(5)).await.unwrap();
+        assert_eq!(out.as_ref(), b"ok");
+        assert_eq!(calls.get(), 3, "two failures then success");
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_max_attempts() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let op = || {
+            calls.set(calls.get() + 1);
+            async { Attempt::Transient("always".into()) }
+        };
+        let err = retry(op, &no_sleep_policy(3)).await.unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)));
+        assert_eq!(calls.get(), 3, "exactly max_attempts tries");
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_retry_not_found_or_permanent() {
+        use std::cell::Cell;
+        let nf_calls = Cell::new(0u32);
+        let nf = || {
+            nf_calls.set(nf_calls.get() + 1);
+            async { Attempt::NotFound }
+        };
+        assert!(matches!(
+            retry(nf, &no_sleep_policy(5)).await,
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(nf_calls.get(), 1, "NotFound is terminal — no retry");
+
+        let p_calls = Cell::new(0u32);
+        let p = || {
+            p_calls.set(p_calls.get() + 1);
+            async { Attempt::Permanent("403".into()) }
+        };
+        assert!(matches!(
+            retry(p, &no_sleep_policy(5)).await,
+            Err(StoreError::Backend(_))
+        ));
+        assert_eq!(p_calls.get(), 1, "permanent is terminal — no retry");
     }
 }
