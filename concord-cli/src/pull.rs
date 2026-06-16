@@ -5,6 +5,7 @@
 //! its chunks, verifying the shard merkle as it reassembles, and writing
 //! the file out to `--out`.
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,6 +15,8 @@ use concord_core::shard::shard_merkle;
 use concord_core::sign;
 use concord_core::store::Store;
 use ed25519_dalek::VerifyingKey;
+
+use crate::resume::{ResumeMarker, ShardPaths, Status};
 
 /// Required arguments for [`pull`].
 #[derive(Clone, Debug)]
@@ -183,6 +186,7 @@ pub async fn pull_with_progress<S: Store + ?Sized>(
         &args.out_dir,
         cache_dir.as_deref(),
         concurrency,
+        args.reverify,
         &emit,
     )
     .await?;
@@ -207,6 +211,89 @@ fn download_concurrency() -> usize {
         .unwrap_or(4)
 }
 
+/// Intra-shard chunk look-ahead. Chunks are fetched up to this many at once
+/// (ordered commit), pipelining the network. `CONCORD_CHUNK_CONCURRENCY`; default 4.
+fn chunk_concurrency() -> usize {
+    std::env::var("CONCORD_CHUNK_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4)
+}
+
+/// Chunks committed before fsync+marker advance. 1 = safest. `CONCORD_COMMIT_EVERY`; default 1.
+fn commit_every() -> u32 {
+    std::env::var("CONCORD_COMMIT_EVERY")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+/// Resolve + authenticate the ordered chunk-hash list for a shard against its
+/// signed merkle root.
+fn resolve_chunk_hashes(shard: &Shard) -> Result<Vec<ChunkHash>> {
+    let chunk_hashes: Vec<ChunkHash> = if !shard.chunks.is_empty() {
+        shard
+            .chunks
+            .iter()
+            .map(|h| h.parse::<ChunkHash>().with_context(|| format!("parse chunk hash {h}")))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let parts = shard.parts.unwrap_or(1);
+        if parts > 1 {
+            bail!(
+                "shard {} has {} chunks but the manifest carries no chunk list \
+                 (predates RFC 0001 chunk-index) — re-push to migrate",
+                shard.role,
+                parts
+            );
+        }
+        vec![shard
+            .merkle
+            .parse::<ChunkHash>()
+            .with_context(|| format!("parse shard merkle: {}", shard.merkle))?]
+    };
+    let recomputed = shard_merkle(&chunk_hashes);
+    if recomputed.to_string() != shard.merkle {
+        bail!(
+            "shard {} chunk list does not match signed merkle: manifest={} computed={}",
+            shard.role,
+            shard.merkle,
+            recomputed
+        );
+    }
+    Ok(chunk_hashes)
+}
+
+/// Fetch one chunk: cache-hit (re-verified) or wire (verified + cached).
+/// Returns `(bytes, cache_hit)`.
+async fn fetch_one_chunk<S: Store + ?Sized>(
+    store: &S,
+    h: &ChunkHash,
+    cache_path: Option<&Path>,
+) -> Result<(bytes::Bytes, bool)> {
+    if let Some(p) = cache_path {
+        if let Ok(b) = std::fs::read(p) {
+            if ChunkHash::of(&b).to_string() == h.to_string() {
+                return Ok((bytes::Bytes::from(b), true));
+            }
+        }
+    }
+    let b = store.get_chunk(h).await.map_err(|e| anyhow!("get chunk {h}: {e}"))?;
+    let got = ChunkHash::of(&b);
+    if got.to_string() != h.to_string() {
+        bail!("chunk {h} content hash mismatch: got {got}");
+    }
+    if let Some(p) = cache_path {
+        let tmp = p.with_extension("partial");
+        if std::fs::write(&tmp, &b).is_ok() {
+            let _ = std::fs::rename(&tmp, p);
+        }
+    }
+    Ok((b, false))
+}
+
 /// Reassemble every shard, up to `concurrency` in flight at once, into
 /// `out_dir`. Each shard is independent (own file, own chunk list), so they
 /// parallelize cleanly; chunk order *within* a shard is still sequential to
@@ -220,29 +307,17 @@ async fn download_shards<S: Store + ?Sized>(
     out_dir: &Path,
     cache_dir: Option<&Path>,
     concurrency: usize,
+    reverify: bool,
     emit: &(impl Fn(PullEvent) + Sync),
 ) -> Result<(u64, u64, u64)> {
-    use futures::stream::{self, StreamExt, TryStreamExt};
+    use futures::stream::{StreamExt, TryStreamExt};
 
     let total = shards.len();
-    let (files, bytes, on_wire) = stream::iter(shards.iter().enumerate())
+    let (files, bytes, on_wire) = futures::stream::iter(shards.iter().enumerate())
         .map(|(i, shard)| async move {
             let idx = i + 1;
-            emit(PullEvent::ShardStart {
-                idx,
-                total,
-                role: shard.role.clone(),
-                format: shard.format.clone(),
-                size: shard.size,
-                parts: shard.parts.unwrap_or(1) as usize,
-                resumed_chunks: 0,
-                resumed_bytes: 0,
-            });
-            let (written, wire) = pull_shard(store, shard, out_dir, cache_dir, idx, emit).await?;
-            emit(PullEvent::ShardDone {
-                idx,
-                filename: shard_filename(shard),
-            });
+            let (written, wire) =
+                pull_shard(store, shard, out_dir, cache_dir, idx, total, reverify, emit).await?;
             Ok::<(u64, u64), anyhow::Error>((written, wire))
         })
         .buffer_unordered(concurrency.max(1))
@@ -266,119 +341,130 @@ fn chunk_cache_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Fetch all chunks for `shard`, verify the merkle root matches the
-/// manifest's claim, and write the reassembled bytes to disk.
-///
-/// Returns `(bytes_written, bytes_on_wire)`. Chunks present in `cache_dir`
-/// are read from disk (no wire bytes); misses are fetched, verified, and
-/// written to the cache for next time. Emits one [`PullEvent::ChunkDone`]
-/// per chunk so the caller can drive a progress bar.
+/// Fetch all chunks for `shard`, streaming them to a `.part` file under
+/// `<out_dir>/.concord/`, then atomic-rename to the final output. Resumes from
+/// the durable marker; skips shards already complete. Returns
+/// `(bytes_written, bytes_on_wire)` — `bytes_written` is the full shard size,
+/// `bytes_on_wire` only what was fetched THIS run.
+#[allow(clippy::too_many_arguments)]
 async fn pull_shard<S: Store + ?Sized>(
     store: &S,
     shard: &Shard,
     out_dir: &Path,
     cache_dir: Option<&Path>,
     idx: usize,
+    total: usize,
+    reverify: bool,
     emit: &(impl Fn(PullEvent) + Sync),
 ) -> Result<(u64, u64)> {
-    // Resolve the ordered chunk-hash list for this shard.
-    //   - Multi-chunk (and new single-chunk) shards carry `chunks` in the
-    //     manifest (RFC 0001 §Shards).
-    //   - Legacy single-chunk shards omit it; then the merkle root IS the
-    //     one chunk's hash.
-    let chunk_hashes: Vec<ChunkHash> = if !shard.chunks.is_empty() {
-        shard
-            .chunks
-            .iter()
-            .map(|h| {
-                h.parse::<ChunkHash>()
-                    .with_context(|| format!("parse chunk hash {h}"))
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        let parts = shard.parts.unwrap_or(1);
-        if parts > 1 {
-            bail!(
-                "shard {} has {} chunks but the manifest carries no chunk list \
-                 (predates RFC 0001 chunk-index) — re-push to migrate",
-                shard.role,
-                parts
-            );
-        }
-        vec![shard
-            .merkle
-            .parse::<ChunkHash>()
-            .with_context(|| format!("parse shard merkle: {}", shard.merkle))?]
+    use futures::stream::{self, StreamExt};
+
+    let chunk_hashes = resolve_chunk_hashes(shard)?;
+    let filename = shard_filename(shard);
+    let paths = ShardPaths::new(out_dir, &filename);
+
+    let shard_start = |resumed_chunks: usize, resumed_bytes: u64| {
+        emit(PullEvent::ShardStart {
+            idx,
+            total,
+            role: shard.role.clone(),
+            format: shard.format.clone(),
+            size: shard.size,
+            parts: shard.parts.unwrap_or(1) as usize,
+            resumed_chunks,
+            resumed_bytes,
+        });
     };
 
-    // Authenticate the chunk list against the signed merkle root: the
-    // manifest signature covers `merkle`, so a matching recomputed root
-    // proves the list is genuine (no separate sidecar signature needed).
-    let recomputed = shard_merkle(&chunk_hashes);
-    if recomputed.to_string() != shard.merkle {
-        bail!(
-            "shard {} chunk list does not match signed merkle: manifest={} computed={}",
-            shard.role,
-            shard.merkle,
-            recomputed
-        );
+    // Skip-done: trust only a marker WE wrote (complete + matching merkle) with
+    // the final file present.
+    if !reverify {
+        if let Some(m) = ResumeMarker::load(&paths.marker_path) {
+            if m.status == Status::Complete && m.merkle == shard.merkle && paths.final_path.exists()
+            {
+                shard_start(chunk_hashes.len(), shard.size);
+                emit(PullEvent::ShardDone { idx, filename });
+                return Ok((shard.size, 0));
+            }
+        }
     }
 
-    // Fetch each chunk, verify its content hash, concatenate in order.
-    // Local cache short-circuits the wire: a chunk already on disk (from a
-    // prior pull or shared with another shard) is a cache-hit, zero wire bytes.
-    let mut body: Vec<u8> = Vec::with_capacity(shard.size as usize);
-    let mut on_wire: u64 = 0;
-    for h in &chunk_hashes {
+    std::fs::create_dir_all(ShardPaths::state_dir(out_dir))
+        .with_context(|| format!("mkdir {}", ShardPaths::state_dir(out_dir).display()))?;
+
+    // Resume point: a partial marker with the SAME merkle, else fresh.
+    let mut marker = if reverify {
+        ResumeMarker::fresh(&shard.merkle)
+    } else {
+        match ResumeMarker::load(&paths.marker_path) {
+            Some(m) if m.status == Status::Partial && m.merkle == shard.merkle => m,
+            _ => ResumeMarker::fresh(&shard.merkle),
+        }
+    };
+
+    // Open `.part`, truncate down to the durable boundary (drops any torn tail),
+    // position for appending. Never reset to 0 on a short file: the durability
+    // invariant guarantees `.part` len >= bytes_done.
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&paths.part_path)
+        .with_context(|| format!("open {}", paths.part_path.display()))?;
+    file.set_len(marker.bytes_done)
+        .with_context(|| format!("truncate {} to {}", paths.part_path.display(), marker.bytes_done))?;
+    file.seek(SeekFrom::End(0)).context("seek part to end")?;
+
+    shard_start(marker.chunks_done, marker.bytes_done);
+
+    let start = marker.chunks_done;
+    let remaining: Vec<(usize, ChunkHash)> =
+        chunk_hashes.iter().cloned().enumerate().skip(start).collect();
+
+    let concurrency = chunk_concurrency();
+    let commit_n = commit_every();
+
+    let mut fetches = stream::iter(remaining.into_iter().map(|(_i, h)| {
         let cache_path = cache_dir.map(|d| d.join(h.to_string()));
+        async move { fetch_one_chunk(store, &h, cache_path.as_deref()).await }
+    }))
+    .buffered(concurrency.max(1));
 
-        // Try the cache first, re-verifying its content hash (local files can
-        // rot; the integrity guarantee must hold regardless of source).
-        let cached = cache_path.as_deref().and_then(|p| std::fs::read(p).ok());
-        let bytes = match cached {
-            Some(b) if ChunkHash::of(&b).to_string() == h.to_string() => {
-                emit(PullEvent::ChunkDone {
-                    idx,
-                    bytes: b.len() as u64,
-                    cache_hit: true,
-                });
-                b
-            }
-            _ => {
-                let b = store
-                    .get_chunk(h)
-                    .await
-                    .map_err(|e| anyhow!("get chunk {h}: {e}"))?;
-                let got = ChunkHash::of(&b);
-                if got.to_string() != h.to_string() {
-                    bail!("chunk {h} content hash mismatch: got {got}");
-                }
-                on_wire += b.len() as u64;
-                // Populate the cache (best-effort; a cache write failure must
-                // not fail the pull). Atomic-ish: write to a temp sibling then
-                // rename so a concurrent reader never sees a partial file.
-                if let Some(p) = &cache_path {
-                    let tmp = p.with_extension("partial");
-                    if std::fs::write(&tmp, &b).is_ok() {
-                        let _ = std::fs::rename(&tmp, p);
-                    }
-                }
-                emit(PullEvent::ChunkDone {
-                    idx,
-                    bytes: b.len() as u64,
-                    cache_hit: false,
-                });
-                b.to_vec()
-            }
-        };
-        body.extend_from_slice(&bytes);
+    let mut on_wire: u64 = 0;
+    let mut since_commit: u32 = 0;
+    while let Some(item) = fetches.next().await {
+        let (bytes, cache_hit) = item?;
+        if !cache_hit {
+            on_wire += bytes.len() as u64;
+        }
+        file.write_all(&bytes)
+            .with_context(|| format!("append to {}", paths.part_path.display()))?;
+        marker.chunks_done += 1;
+        marker.bytes_done += bytes.len() as u64;
+        since_commit += 1;
+        if since_commit >= commit_n {
+            file.flush().context("flush part")?;
+            file.sync_all().context("fsync part")?;
+            marker.save(&paths.marker_path)?;
+            since_commit = 0;
+        }
+        emit(PullEvent::ChunkDone {
+            idx,
+            bytes: bytes.len() as u64,
+            cache_hit,
+        });
     }
 
-    let filename = shard_filename(shard);
-    let path = out_dir.join(&filename);
-    std::fs::write(&path, &body).with_context(|| format!("write {}", path.display()))?;
+    file.flush().context("flush part")?;
+    file.sync_all().context("fsync part")?;
+    drop(file);
+    std::fs::rename(&paths.part_path, &paths.final_path)
+        .with_context(|| format!("rename {} → {}", paths.part_path.display(), paths.final_path.display()))?;
+    marker.status = Status::Complete;
+    marker.save(&paths.marker_path)?;
 
-    Ok((body.len() as u64, on_wire))
+    emit(PullEvent::ShardDone { idx, filename });
+    Ok((shard.size, on_wire))
 }
 
 /// Map a shard back to a filename. role+format → `<role>.<format>`,
@@ -467,7 +553,7 @@ mod tests {
             chunks: hashes.iter().map(|h| h.to_string()).collect(),
         };
         let dir = tempfile::tempdir().unwrap();
-        let (n, wire) = pull_shard(&store, &shard, dir.path(), None, 1, &|_| {})
+        let (n, wire) = pull_shard(&store, &shard, dir.path(), None, 1, 1, false, &|_| {})
             .await
             .unwrap();
         assert_eq!(n, 230);
@@ -495,7 +581,7 @@ mod tests {
             chunks: vec![h.to_string(), h.to_string()],
         };
         let dir = tempfile::tempdir().unwrap();
-        assert!(pull_shard(&store, &shard, dir.path(), None, 1, &|_| {})
+        assert!(pull_shard(&store, &shard, dir.path(), None, 1, 1, false, &|_| {})
             .await
             .is_err());
     }
@@ -663,7 +749,7 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let (files, bytes, _on_wire) =
-            download_shards(&store, &shards, out.path(), None, 4, &|_| {})
+            download_shards(&store, &shards, out.path(), None, 4, false, &|_| {})
                 .await
                 .unwrap();
 
@@ -708,7 +794,7 @@ mod tests {
 
         // First pull: cold cache → fetched over the wire.
         let out1 = tempfile::tempdir().unwrap();
-        let (w1, wire1) = pull_shard(&store, &shard, out1.path(), Some(cache.path()), 1, &|_| {})
+        let (w1, wire1) = pull_shard(&store, &shard, out1.path(), Some(cache.path()), 1, 1, false, &|_| {})
             .await
             .unwrap();
         assert_eq!((w1, wire1), (256, 256), "cold pull fetches over the wire");
@@ -716,7 +802,7 @@ mod tests {
 
         // Second pull: warm cache → served from disk, zero wire bytes.
         let out2 = tempfile::tempdir().unwrap();
-        let (w2, wire2) = pull_shard(&store, &shard, out2.path(), Some(cache.path()), 1, &|_| {})
+        let (w2, wire2) = pull_shard(&store, &shard, out2.path(), Some(cache.path()), 1, 1, false, &|_| {})
             .await
             .unwrap();
         assert_eq!(w2, 256, "still reassembles full bytes from cache");
@@ -728,5 +814,163 @@ mod tests {
         );
         let got = std::fs::read(out2.path().join("weights.bin")).unwrap();
         assert_eq!(got, body, "cached reassembly matches original");
+    }
+
+    use crate::resume::{ResumeMarker, ShardPaths, Status};
+
+    async fn three_chunk_shard(
+        store: &concord_core::store::MemoryStore,
+    ) -> (Shard, Vec<Vec<u8>>) {
+        let bodies: Vec<Vec<u8>> = vec![vec![1u8; 100], vec![2u8; 80], vec![3u8; 50]];
+        let mut hashes = Vec::new();
+        for b in &bodies {
+            let h = ChunkHash::of(b.as_slice());
+            store.put_chunk(&h, bytes::Bytes::from(b.clone())).await.unwrap();
+            hashes.push(h);
+        }
+        let shard = Shard {
+            role: "weights".into(),
+            format: "bin".into(),
+            parts: Some(3),
+            size: 230,
+            merkle: shard_merkle(&hashes).to_string(),
+            chunks: hashes.iter().map(|h| h.to_string()).collect(),
+        };
+        (shard, bodies)
+    }
+
+    #[tokio::test]
+    async fn fresh_pull_streams_full_file() {
+        let inner = concord_core::store::MemoryStore::new();
+        let (shard, bodies) = three_chunk_shard(&inner).await;
+        let store = CountingStore::new(inner);
+        let out = tempfile::tempdir().unwrap();
+        let (written, wire) =
+            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        assert_eq!((written, wire), (230, 230));
+        assert_eq!(store.gets(), 3);
+        let got = std::fs::read(out.path().join("weights.bin")).unwrap();
+        assert_eq!(got, bodies.concat());
+        let p = ShardPaths::new(out.path(), "weights.bin");
+        assert_eq!(ResumeMarker::load(&p.marker_path).unwrap().status, Status::Complete);
+    }
+
+    #[tokio::test]
+    async fn skip_done_does_not_refetch() {
+        let inner = concord_core::store::MemoryStore::new();
+        let (shard, _bodies) = three_chunk_shard(&inner).await;
+        let store = CountingStore::new(inner);
+        let out = tempfile::tempdir().unwrap();
+        pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        let after_first = store.gets();
+        let (written, wire) =
+            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        assert_eq!((written, wire), (230, 0));
+        assert_eq!(store.gets(), after_first, "skip-done must not re-fetch");
+    }
+
+    #[tokio::test]
+    async fn resume_fetches_only_remaining_chunks() {
+        let inner = concord_core::store::MemoryStore::new();
+        let (shard, bodies) = three_chunk_shard(&inner).await;
+        let store = CountingStore::new(inner);
+        let out = tempfile::tempdir().unwrap();
+        let p = ShardPaths::new(out.path(), "weights.bin");
+        std::fs::create_dir_all(ShardPaths::state_dir(out.path())).unwrap();
+        std::fs::write(&p.part_path, &bodies[0]).unwrap();
+        ResumeMarker {
+            version: crate::resume::MARKER_VERSION,
+            merkle: shard.merkle.clone(),
+            chunks_done: 1,
+            bytes_done: bodies[0].len() as u64,
+            status: Status::Partial,
+        }
+        .save(&p.marker_path)
+        .unwrap();
+        let (written, wire) =
+            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        assert_eq!(written, 230);
+        assert_eq!(wire, (bodies[1].len() + bodies[2].len()) as u64, "only tail on the wire");
+        assert_eq!(store.gets(), 2, "chunk 0 already done → only 2 fetched");
+        assert_eq!(std::fs::read(out.path().join("weights.bin")).unwrap(), bodies.concat());
+    }
+
+    #[tokio::test]
+    async fn stale_merkle_discards_part_and_refetches() {
+        let inner = concord_core::store::MemoryStore::new();
+        let (shard, bodies) = three_chunk_shard(&inner).await;
+        let store = CountingStore::new(inner);
+        let out = tempfile::tempdir().unwrap();
+        let p = ShardPaths::new(out.path(), "weights.bin");
+        std::fs::create_dir_all(ShardPaths::state_dir(out.path())).unwrap();
+        std::fs::write(&p.part_path, b"garbage from another version").unwrap();
+        ResumeMarker {
+            version: crate::resume::MARKER_VERSION,
+            merkle: "b3:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            chunks_done: 1,
+            bytes_done: 999,
+            status: Status::Partial,
+        }
+        .save(&p.marker_path)
+        .unwrap();
+        let (written, _wire) =
+            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        assert_eq!(written, 230);
+        assert_eq!(store.gets(), 3, "stale .part → full re-fetch");
+        assert_eq!(std::fs::read(out.path().join("weights.bin")).unwrap(), bodies.concat());
+    }
+
+    #[tokio::test]
+    async fn torn_write_is_truncated_then_resumed() {
+        let inner = concord_core::store::MemoryStore::new();
+        let (shard, bodies) = three_chunk_shard(&inner).await;
+        let store = CountingStore::new(inner);
+        let out = tempfile::tempdir().unwrap();
+        let p = ShardPaths::new(out.path(), "weights.bin");
+        std::fs::create_dir_all(ShardPaths::state_dir(out.path())).unwrap();
+        let mut torn = bodies[0].clone();
+        torn.extend_from_slice(b"torn-partial-write");
+        std::fs::write(&p.part_path, &torn).unwrap();
+        ResumeMarker {
+            version: crate::resume::MARKER_VERSION,
+            merkle: shard.merkle.clone(),
+            chunks_done: 1,
+            bytes_done: bodies[0].len() as u64,
+            status: Status::Partial,
+        }
+        .save(&p.marker_path)
+        .unwrap();
+        let (written, _wire) =
+            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        assert_eq!(written, 230);
+        assert_eq!(std::fs::read(out.path().join("weights.bin")).unwrap(), bodies.concat(),
+                   "torn tail truncated, file reassembles correctly");
+    }
+
+    #[tokio::test]
+    async fn reverify_ignores_complete_marker() {
+        let inner = concord_core::store::MemoryStore::new();
+        let (shard, _bodies) = three_chunk_shard(&inner).await;
+        let store = CountingStore::new(inner);
+        let out = tempfile::tempdir().unwrap();
+        pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        let after_first = store.gets();
+        pull_shard(&store, &shard, out.path(), None, 1, 1, true, &|_| {}).await.unwrap();
+        assert!(store.gets() > after_first, "reverify must re-fetch");
+    }
+
+    #[tokio::test]
+    async fn ordered_assembly_with_concurrency() {
+        std::env::set_var("CONCORD_CHUNK_CONCURRENCY", "4");
+        let inner = concord_core::store::MemoryStore::new();
+        let (shard, bodies) = three_chunk_shard(&inner).await;
+        let store = CountingStore::new(inner);
+        let out = tempfile::tempdir().unwrap();
+        let (written, _w) =
+            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        assert_eq!(written, 230);
+        assert_eq!(std::fs::read(out.path().join("weights.bin")).unwrap(), bodies.concat(),
+                   "buffered(C) preserves chunk order");
+        std::env::remove_var("CONCORD_CHUNK_CONCURRENCY");
     }
 }
