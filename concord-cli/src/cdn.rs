@@ -116,6 +116,7 @@ pub struct CdnStore {
     /// by passing a different bucket name.
     base: String,
     http: reqwest::Client,
+    policy: RetryPolicy,
 }
 
 impl CdnStore {
@@ -131,6 +132,7 @@ impl CdnStore {
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             http,
+            policy: RetryPolicy::from_env(),
         })
     }
 
@@ -153,21 +155,33 @@ impl CdnStore {
         self.fetch(&self.keys_url()).await
     }
 
-    async fn fetch(&self, url: &str) -> Result<Bytes, StoreError> {
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| StoreError::Backend(format!("http get {url}: {e}")))?;
-        match resp.status() {
-            s if s.is_success() => resp
-                .bytes()
-                .await
-                .map_err(|e| StoreError::Backend(format!("read body {url}: {e}"))),
-            reqwest::StatusCode::NOT_FOUND => Err(StoreError::NotFound),
-            other => Err(StoreError::Backend(format!("HTTP {other} from {url}"))),
+    /// One GET attempt, classified for the retry loop. A per-request timeout
+    /// (so the origin's known zero-body hang trips a timeout → retry, instead
+    /// of wedging the connection).
+    async fn get_once(&self, url: &str) -> Attempt {
+        let resp = match self.http.get(url).timeout(self.policy.http_timeout).send().await {
+            Ok(r) => r,
+            // Connect/timeout/transport errors are transient — retry.
+            Err(e) => return Attempt::Transient(format!("http get {url}: {e}")),
+        };
+        let status = resp.status();
+        if status.is_success() {
+            return match resp.bytes().await {
+                Ok(b) => Attempt::Ok(b),
+                Err(e) => Attempt::Transient(format!("read body {url}: {e}")),
+            };
         }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Attempt::NotFound;
+        }
+        if is_transient(status.as_u16()) {
+            return Attempt::Transient(format!("HTTP {status} from {url}"));
+        }
+        Attempt::Permanent(format!("HTTP {status} from {url}"))
+    }
+
+    async fn fetch(&self, url: &str) -> Result<Bytes, StoreError> {
+        retry(|| self.get_once(url), &self.policy).await
     }
 }
 
