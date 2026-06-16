@@ -47,8 +47,11 @@ impl ResumeMarker {
     /// schema version — all "treat as no progress" cases.
     pub fn load(path: &Path) -> Option<Self> {
         let raw = std::fs::read(path).ok()?;
-        let m: ResumeMarker = serde_json::from_slice(&raw).ok()?;
+        let m: ResumeMarker = serde_json::from_slice(&raw)
+            .inspect_err(|e| tracing::warn!(?path, %e, "corrupt resume marker — starting fresh"))
+            .ok()?;
         if m.version != MARKER_VERSION {
+            tracing::debug!(?path, version = m.version, "resume marker version mismatch — starting fresh");
             return None;
         }
         Some(m)
@@ -56,7 +59,12 @@ impl ResumeMarker {
 
     /// Atomically persist the marker (temp file + rename) so a crash mid-write
     /// never leaves a corrupt marker.
+    /// Marker durability depends on OS write-back; worst case on power-loss is a re-download (the .part is fsync'd separately), never corruption.
     pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
         let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_vec(self).context("serialize resume marker")?;
         std::fs::write(&tmp, &data).with_context(|| format!("write {}", tmp.display()))?;
@@ -78,6 +86,7 @@ pub struct ShardPaths {
 }
 
 impl ShardPaths {
+    /// Compute the final, .part, and marker paths for `filename` under `out_dir`.
     pub fn new(out_dir: &Path, filename: &str) -> Self {
         let state = out_dir.join(STATE_DIR);
         Self {
