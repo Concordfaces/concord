@@ -237,7 +237,10 @@ fn resolve_chunk_hashes(shard: &Shard) -> Result<Vec<ChunkHash>> {
         shard
             .chunks
             .iter()
-            .map(|h| h.parse::<ChunkHash>().with_context(|| format!("parse chunk hash {h}")))
+            .map(|h| {
+                h.parse::<ChunkHash>()
+                    .with_context(|| format!("parse chunk hash {h}"))
+            })
             .collect::<Result<Vec<_>>>()?
     } else {
         let parts = shard.parts.unwrap_or(1);
@@ -280,7 +283,10 @@ async fn fetch_one_chunk<S: Store + ?Sized>(
             }
         }
     }
-    let b = store.get_chunk(h).await.map_err(|e| anyhow!("get chunk {h}: {e}"))?;
+    let b = store
+        .get_chunk(h)
+        .await
+        .map_err(|e| anyhow!("get chunk {h}: {e}"))?;
     let got = ChunkHash::of(&b);
     if got != *h {
         bail!("chunk {h} content hash mismatch: got {got}");
@@ -420,8 +426,13 @@ async fn pull_shard<S: Store + ?Sized>(
     if actual_len < marker.bytes_done {
         marker = ResumeMarker::fresh(&shard.merkle);
     }
-    file.set_len(marker.bytes_done)
-        .with_context(|| format!("truncate {} to {}", paths.part_path.display(), marker.bytes_done))?;
+    file.set_len(marker.bytes_done).with_context(|| {
+        format!(
+            "truncate {} to {}",
+            paths.part_path.display(),
+            marker.bytes_done
+        )
+    })?;
     file.seek(SeekFrom::End(0)).context("seek part to end")?;
 
     shard_start(marker.chunks_done, marker.bytes_done);
@@ -466,8 +477,13 @@ async fn pull_shard<S: Store + ?Sized>(
     file.flush().context("flush part")?;
     file.sync_all().context("fsync part")?;
     drop(file);
-    std::fs::rename(&paths.part_path, &paths.final_path)
-        .with_context(|| format!("rename {} → {}", paths.part_path.display(), paths.final_path.display()))?;
+    std::fs::rename(&paths.part_path, &paths.final_path).with_context(|| {
+        format!(
+            "rename {} → {}",
+            paths.part_path.display(),
+            paths.final_path.display()
+        )
+    })?;
     marker.status = Status::Complete;
     marker.save(&paths.marker_path)?;
 
@@ -589,9 +605,11 @@ mod tests {
             chunks: vec![h.to_string(), h.to_string()],
         };
         let dir = tempfile::tempdir().unwrap();
-        assert!(pull_shard(&store, &shard, dir.path(), None, 1, 1, false, &|_| {})
-            .await
-            .is_err());
+        assert!(
+            pull_shard(&store, &shard, dir.path(), None, 1, 1, false, &|_| {})
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -802,17 +820,35 @@ mod tests {
 
         // First pull: cold cache → fetched over the wire.
         let out1 = tempfile::tempdir().unwrap();
-        let (w1, wire1) = pull_shard(&store, &shard, out1.path(), Some(cache.path()), 1, 1, false, &|_| {})
-            .await
-            .unwrap();
+        let (w1, wire1) = pull_shard(
+            &store,
+            &shard,
+            out1.path(),
+            Some(cache.path()),
+            1,
+            1,
+            false,
+            &|_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!((w1, wire1), (256, 256), "cold pull fetches over the wire");
         assert_eq!(store.gets(), 1);
 
         // Second pull: warm cache → served from disk, zero wire bytes.
         let out2 = tempfile::tempdir().unwrap();
-        let (w2, wire2) = pull_shard(&store, &shard, out2.path(), Some(cache.path()), 1, 1, false, &|_| {})
-            .await
-            .unwrap();
+        let (w2, wire2) = pull_shard(
+            &store,
+            &shard,
+            out2.path(),
+            Some(cache.path()),
+            1,
+            1,
+            false,
+            &|_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(w2, 256, "still reassembles full bytes from cache");
         assert_eq!(wire2, 0, "cache hit fetches nothing over the wire");
         assert_eq!(
@@ -824,14 +860,15 @@ mod tests {
         assert_eq!(got, body, "cached reassembly matches original");
     }
 
-    async fn three_chunk_shard(
-        store: &concord_core::store::MemoryStore,
-    ) -> (Shard, Vec<Vec<u8>>) {
+    async fn three_chunk_shard(store: &concord_core::store::MemoryStore) -> (Shard, Vec<Vec<u8>>) {
         let bodies: Vec<Vec<u8>> = vec![vec![1u8; 100], vec![2u8; 80], vec![3u8; 50]];
         let mut hashes = Vec::new();
         for b in &bodies {
             let h = ChunkHash::of(b.as_slice());
-            store.put_chunk(&h, bytes::Bytes::from(b.clone())).await.unwrap();
+            store
+                .put_chunk(&h, bytes::Bytes::from(b.clone()))
+                .await
+                .unwrap();
             hashes.push(h);
         }
         let shard = Shard {
@@ -851,14 +888,18 @@ mod tests {
         let (shard, bodies) = three_chunk_shard(&inner).await;
         let store = CountingStore::new(inner);
         let out = tempfile::tempdir().unwrap();
-        let (written, wire) =
-            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        let (written, wire) = pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
         assert_eq!((written, wire), (230, 230));
         assert_eq!(store.gets(), 3);
         let got = std::fs::read(out.path().join("weights.bin")).unwrap();
         assert_eq!(got, bodies.concat());
         let p = ShardPaths::new(out.path(), "weights.bin");
-        assert_eq!(ResumeMarker::load(&p.marker_path).unwrap().status, Status::Complete);
+        assert_eq!(
+            ResumeMarker::load(&p.marker_path).unwrap().status,
+            Status::Complete
+        );
     }
 
     #[tokio::test]
@@ -867,10 +908,13 @@ mod tests {
         let (shard, _bodies) = three_chunk_shard(&inner).await;
         let store = CountingStore::new(inner);
         let out = tempfile::tempdir().unwrap();
-        pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
         let after_first = store.gets();
-        let (written, wire) =
-            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        let (written, wire) = pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
         assert_eq!((written, wire), (230, 0));
         assert_eq!(store.gets(), after_first, "skip-done must not re-fetch");
     }
@@ -893,12 +937,20 @@ mod tests {
         }
         .save(&p.marker_path)
         .unwrap();
-        let (written, wire) =
-            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        let (written, wire) = pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
         assert_eq!(written, 230);
-        assert_eq!(wire, (bodies[1].len() + bodies[2].len()) as u64, "only tail on the wire");
+        assert_eq!(
+            wire,
+            (bodies[1].len() + bodies[2].len()) as u64,
+            "only tail on the wire"
+        );
         assert_eq!(store.gets(), 2, "chunk 0 already done → only 2 fetched");
-        assert_eq!(std::fs::read(out.path().join("weights.bin")).unwrap(), bodies.concat());
+        assert_eq!(
+            std::fs::read(out.path().join("weights.bin")).unwrap(),
+            bodies.concat()
+        );
     }
 
     #[tokio::test]
@@ -919,11 +971,15 @@ mod tests {
         }
         .save(&p.marker_path)
         .unwrap();
-        let (written, _wire) =
-            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        let (written, _wire) = pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
         assert_eq!(written, 230);
         assert_eq!(store.gets(), 3, "stale .part → full re-fetch");
-        assert_eq!(std::fs::read(out.path().join("weights.bin")).unwrap(), bodies.concat());
+        assert_eq!(
+            std::fs::read(out.path().join("weights.bin")).unwrap(),
+            bodies.concat()
+        );
     }
 
     #[tokio::test]
@@ -946,11 +1002,15 @@ mod tests {
         }
         .save(&p.marker_path)
         .unwrap();
-        let (written, _wire) =
-            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        let (written, _wire) = pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
         assert_eq!(written, 230);
-        assert_eq!(std::fs::read(out.path().join("weights.bin")).unwrap(), bodies.concat(),
-                   "torn tail truncated, file reassembles correctly");
+        assert_eq!(
+            std::fs::read(out.path().join("weights.bin")).unwrap(),
+            bodies.concat(),
+            "torn tail truncated, file reassembles correctly"
+        );
     }
 
     #[tokio::test]
@@ -959,9 +1019,13 @@ mod tests {
         let (shard, _bodies) = three_chunk_shard(&inner).await;
         let store = CountingStore::new(inner);
         let out = tempfile::tempdir().unwrap();
-        pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
         let after_first = store.gets();
-        pull_shard(&store, &shard, out.path(), None, 1, 1, true, &|_| {}).await.unwrap();
+        pull_shard(&store, &shard, out.path(), None, 1, 1, true, &|_| {})
+            .await
+            .unwrap();
         assert!(store.gets() > after_first, "reverify must re-fetch");
     }
 
@@ -971,11 +1035,15 @@ mod tests {
         let (shard, bodies) = three_chunk_shard(&inner).await;
         let store = CountingStore::new(inner);
         let out = tempfile::tempdir().unwrap();
-        let (written, _w) =
-            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        let (written, _w) = pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
         assert_eq!(written, 230);
-        assert_eq!(std::fs::read(out.path().join("weights.bin")).unwrap(), bodies.concat(),
-                   "buffered(C) preserves chunk order");
+        assert_eq!(
+            std::fs::read(out.path().join("weights.bin")).unwrap(),
+            bodies.concat(),
+            "buffered(C) preserves chunk order"
+        );
     }
 
     #[tokio::test]
@@ -1000,8 +1068,9 @@ mod tests {
         }
         .save(&p.marker_path)
         .unwrap();
-        let (written, _wire) =
-            pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {}).await.unwrap();
+        let (written, _wire) = pull_shard(&store, &shard, out.path(), None, 1, 1, false, &|_| {})
+            .await
+            .unwrap();
         assert_eq!(written, 230);
         assert_eq!(
             std::fs::read(out.path().join("weights.bin")).unwrap(),

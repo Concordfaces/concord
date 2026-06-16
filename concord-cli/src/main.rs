@@ -383,7 +383,10 @@ fn make_pull_progress() -> PullProgress {
             // Start the bar at what's already on disk so resume doesn't replay.
             pb.set_position(resumed_bytes);
             if resumed_chunks > 0 {
-                pb.set_message(format!("resumed {}", concord_cli::fmt::human_bytes(resumed_bytes)));
+                pb.set_message(format!(
+                    "resumed {}",
+                    concord_cli::fmt::human_bytes(resumed_bytes)
+                ));
             } else if parts > 1 {
                 pb.set_message(format!("{parts} parts"));
             }

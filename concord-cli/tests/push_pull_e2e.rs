@@ -217,12 +217,21 @@ async fn second_pull_skips_completed_shards() {
     // First pull: completes the shards (store fetch or cache hit).
     let (_m1, s1) = pull(&store, &args, &vk).await.unwrap();
     let total_bytes: u64 = originals.values().map(|b| b.len() as u64).sum();
-    assert_eq!(s1.bytes, total_bytes, "first pull reports correct logical bytes");
+    assert_eq!(
+        s1.bytes, total_bytes,
+        "first pull reports correct logical bytes"
+    );
 
     // Second pull into the SAME out_dir: ResumeMarker is Complete and the
     // final files exist → pull_shard short-circuits before any fetch.
     // This holds regardless of the chunk cache: skip-done fires first.
     let (_m2, s2) = pull(&store, &args, &vk).await.unwrap();
-    assert_eq!(s2.on_wire, 0, "second pull is fully skip-done — zero wire bytes");
-    assert_eq!(s2.bytes, s1.bytes, "same logical bytes reported on second pull");
+    assert_eq!(
+        s2.on_wire, 0,
+        "second pull is fully skip-done — zero wire bytes"
+    );
+    assert_eq!(
+        s2.bytes, s1.bytes,
+        "same logical bytes reported on second pull"
+    );
 }

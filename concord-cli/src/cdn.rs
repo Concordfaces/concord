@@ -71,7 +71,10 @@ impl RetryPolicy {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Outcome of one fetch attempt, classified for the retry loop.
@@ -162,7 +165,13 @@ impl CdnStore {
     async fn get_once(&self, url: &str) -> Attempt {
         // reqwest's per-request timeout covers the ENTIRE exchange — connect,
         // headers, AND body drain — so a stalled body read can't hang past it.
-        let resp = match self.http.get(url).timeout(self.policy.http_timeout).send().await {
+        let resp = match self
+            .http
+            .get(url)
+            .timeout(self.policy.http_timeout)
+            .send()
+            .await
+        {
             Ok(r) => r,
             // Any .send() error (connect, timeout, TLS, DNS) is treated as
             // transient. Non-recoverable cases (bad DNS/cert) will simply
@@ -353,7 +362,10 @@ mod tests {
             nf_calls.set(nf_calls.get() + 1);
             async { Attempt::NotFound }
         };
-        assert!(matches!(retry(nf, &no_sleep_policy(5)).await, Err(StoreError::NotFound)));
+        assert!(matches!(
+            retry(nf, &no_sleep_policy(5)).await,
+            Err(StoreError::NotFound)
+        ));
         assert_eq!(nf_calls.get(), 1, "NotFound is terminal — no retry");
 
         let p_calls = Cell::new(0u32);
@@ -361,7 +373,10 @@ mod tests {
             p_calls.set(p_calls.get() + 1);
             async { Attempt::Permanent("403".into()) }
         };
-        assert!(matches!(retry(p, &no_sleep_policy(5)).await, Err(StoreError::Backend(_))));
+        assert!(matches!(
+            retry(p, &no_sleep_policy(5)).await,
+            Err(StoreError::Backend(_))
+        ));
         assert_eq!(p_calls.get(), 1, "permanent is terminal — no retry");
     }
 }

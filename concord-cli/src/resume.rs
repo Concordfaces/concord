@@ -51,7 +51,11 @@ impl ResumeMarker {
             .inspect_err(|e| tracing::warn!(?path, %e, "corrupt resume marker — starting fresh"))
             .ok()?;
         if m.version != MARKER_VERSION {
-            tracing::debug!(?path, version = m.version, "resume marker version mismatch — starting fresh");
+            tracing::debug!(
+                ?path,
+                version = m.version,
+                "resume marker version mismatch — starting fresh"
+            );
             return None;
         }
         Some(m)
@@ -137,7 +141,10 @@ mod tests {
 
     #[test]
     fn load_missing_is_none() {
-        assert_eq!(ResumeMarker::load(std::path::Path::new("/no/such.json")), None);
+        assert_eq!(
+            ResumeMarker::load(std::path::Path::new("/no/such.json")),
+            None
+        );
     }
 
     #[test]
