@@ -49,6 +49,46 @@ impl PushStats {
     }
 }
 
+/// GGUF scheme from a `*.<SCHEME>.gguf` filename (`model.Q4_K_M.gguf` → `Q4_K_M`).
+/// `None` when there's no scheme segment.
+#[allow(dead_code)] // wired in Task 4
+fn gguf_scheme(fname: &str) -> Option<String> {
+    let stem = fname.strip_suffix(".gguf")?;
+    stem.rsplit_once('.').map(|(_, sc)| sc.to_string())
+}
+
+/// Best-effort quantization from a single unambiguous source signal. `None` if
+/// nothing clear. Never errors (any IO/parse failure → None).
+#[allow(dead_code)] // wired in Task 4
+fn derive_quant(dir: &Path) -> Option<Quantization> {
+    let ggufs: Vec<String> = std::fs::read_dir(dir).ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".gguf"))
+        .collect();
+    if ggufs.len() == 1 {
+        return Some(Quantization { method: "gguf".into(), scheme: gguf_scheme(&ggufs[0]), bits: None });
+    }
+    if ggufs.len() > 1 {
+        return None; // ambiguous — pusher declares via --quant
+    }
+    let cfg = std::fs::read(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
+    let qc = v.get("quantization_config")?;
+    let method = qc.get("quant_method")?.as_str()?.to_string();
+    let bits = qc.get("bits").or_else(|| qc.get("w_bit"))
+        .and_then(|b| b.as_u64()).and_then(|b| u8::try_from(b).ok());
+    Some(Quantization { method, scheme: None, bits })
+}
+
+/// Base model from `config.json.base_model`, when present.
+#[allow(dead_code)] // wired in Task 4
+fn derive_base_model(dir: &Path) -> Option<String> {
+    let cfg = std::fs::read(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
+    v.get("base_model")?.as_str().map(|s| s.to_string())
+}
+
 /// Parse `--quant` as `method[:scheme][/bits]`, e.g. `gguf:Q4_K_M`, `awq/4`,
 /// `gptq:128g/4`, `nvfp4/4`, `fp8`.
 pub fn parse_quant(s: &str) -> Result<Quantization> {
@@ -598,5 +638,41 @@ mod tests {
             issued_at: Some("2026-05-26T00:00:00Z".into()),
         };
         assert!(push(&store, &args, &sk).await.is_err());
+    }
+
+    #[test]
+    fn gguf_scheme_from_filename() {
+        assert_eq!(super::gguf_scheme("model.Q4_K_M.gguf").as_deref(), Some("Q4_K_M"));
+        assert_eq!(super::gguf_scheme("foo.Q8_0.gguf").as_deref(), Some("Q8_0"));
+        assert_eq!(super::gguf_scheme("model.gguf"), None); // no scheme segment
+        assert_eq!(super::gguf_scheme("model.safetensors"), None);
+    }
+
+    #[test]
+    fn derive_quant_and_base_from_dir() {
+        use concord_core::manifest::Quantization;
+        // one .gguf → gguf + scheme, no bits.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("model.Q5_K_M.gguf"), b"x").unwrap();
+        assert_eq!(super::derive_quant(d.path()),
+            Some(Quantization { method: "gguf".into(), scheme: Some("Q5_K_M".into()), bits: None }));
+
+        // two .gguf → ambiguous → None.
+        std::fs::write(d.path().join("model.Q8_0.gguf"), b"y").unwrap();
+        assert_eq!(super::derive_quant(d.path()), None);
+
+        // config.json quantization_config → method + bits; base_model.
+        let d2 = tempfile::tempdir().unwrap();
+        std::fs::write(d2.path().join("config.json"),
+            br#"{"quantization_config":{"quant_method":"awq","bits":4},"base_model":"org/base"}"#).unwrap();
+        assert_eq!(super::derive_quant(d2.path()),
+            Some(Quantization { method: "awq".into(), scheme: None, bits: Some(4) }));
+        assert_eq!(super::derive_base_model(d2.path()).as_deref(), Some("org/base"));
+
+        // plain dir → no quant, no base.
+        let d3 = tempfile::tempdir().unwrap();
+        std::fs::write(d3.path().join("config.json"), br#"{"hidden_size":4}"#).unwrap();
+        assert_eq!(super::derive_quant(d3.path()), None);
+        assert_eq!(super::derive_base_model(d3.path()), None);
     }
 }
