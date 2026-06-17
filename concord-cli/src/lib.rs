@@ -8,6 +8,7 @@
 pub mod cdn;
 pub mod fmt;
 pub mod key;
+pub mod limiter;
 pub mod pull;
 pub mod push;
 pub mod resume;

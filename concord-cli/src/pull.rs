@@ -230,15 +230,18 @@ fn chunk_concurrency() -> usize {
 /// cold throughput peaks near 2 in-flight and collapses past ~4 — so a small
 /// global cap downloads FASTER than wide fan-out (and avoids 503s). Raise once
 /// the origin streams properly. `CONCORD_MAX_INFLIGHT`; default 2.
-fn inflight_sem() -> &'static tokio::sync::Semaphore {
-    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SEM.get_or_init(|| {
-        let n = std::env::var("CONCORD_MAX_INFLIGHT")
+/// Process-global adaptive in-flight limiter (AIMD). Starts at 2 concurrent
+/// wire fetches and adapts up to `CONCORD_MAX_INFLIGHT` (default 12) while
+/// latency stays healthy, backing off on contention/errors. See `limiter`.
+fn limiter() -> &'static crate::limiter::Limiter {
+    static L: std::sync::OnceLock<crate::limiter::Limiter> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        let max = std::env::var("CONCORD_MAX_INFLIGHT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(2);
-        tokio::sync::Semaphore::new(n)
+            .unwrap_or(12);
+        crate::limiter::Limiter::new(2, 1, max)
     })
 }
 
@@ -304,19 +307,25 @@ async fn fetch_one_chunk<S: Store + ?Sized>(
             }
         }
     }
-    // Cap concurrent OVER-THE-WIRE fetches globally (across all shards). The
-    // operator's reconstruct path contends under load — measured cold
-    // throughput peaks near 2 in-flight and collapses past ~4 — so a small
-    // global cap is FASTER than wide fan-out. Cache hits (above) never wait.
-    let b = {
-        let _permit = inflight_sem()
-            .acquire()
-            .await
-            .expect("inflight semaphore not closed");
-        store
-            .get_chunk(h)
-            .await
-            .map_err(|e| anyhow!("get chunk {h}: {e}"))?
+    // Gate OVER-THE-WIRE fetches through the adaptive limiter (cache hits above
+    // never wait). Time each fetch + feed the outcome back so the limiter grows
+    // concurrency when the path is fast (edge-warm) and backs off under the
+    // origin's contention (cold). The permit is released before recording.
+    let lim = limiter();
+    let permit = lim.acquire().await;
+    let t0 = std::time::Instant::now();
+    let result = store.get_chunk(h).await;
+    let dur = t0.elapsed();
+    drop(permit);
+    let b = match result {
+        Ok(b) => {
+            lim.record(b.len(), dur, false).await;
+            b
+        }
+        Err(e) => {
+            lim.record(0, dur, true).await;
+            return Err(anyhow!("get chunk {h}: {e}"));
+        }
     };
     let got = ChunkHash::of(&b);
     if got != *h {
