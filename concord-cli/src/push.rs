@@ -181,6 +181,7 @@ pub async fn push_with_progress<S: Store + ?Sized>(
             protocol: concord_core::PROTOCOL_VERSION.to_string(),
             issuer,
             issued_at,
+            base_model: None,
         },
         license: License {
             spdx: args.license_spdx.clone(),
@@ -190,6 +191,7 @@ pub async fn push_with_progress<S: Store + ?Sized>(
         shards,
         pull_policy: None,
         supersedes: None,
+        quantization: None,
         signature: None,
     };
     unsigned.validate().context("manifest validation")?;

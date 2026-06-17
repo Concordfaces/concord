@@ -28,6 +28,9 @@ pub struct Manifest {
     pub pull_policy: Option<PullPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<Supersedes>,
+    /// Present iff this model is a quantization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<Quantization>,
     /// Filled by `sign()`. Empty on a freshly built or just-parsed unsigned
     /// manifest. Excluded from the canonical bytes the signature covers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,6 +45,10 @@ pub struct ManifestHeader {
     pub issuer: String,
     /// RFC 3339 UTC; MUST end in `Z`.
     pub issued_at: String,
+    /// For a quantization: the base model it derives from (e.g. `org/model`).
+    /// Omitted for a base model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -94,6 +101,20 @@ pub struct PullPolicy {
 pub struct Supersedes {
     pub version: String,
     pub reason: String,
+}
+
+/// Quantization descriptor for a quantized model. `method` is freeform so new
+/// formats (nvfp4, mxfp4, …) need no schema change.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Quantization {
+    /// `gguf | awq | gptq | bitsandbytes | fp8 | nvfp4 | mxfp4 | <freeform>`.
+    pub method: String,
+    /// GGUF scheme / method-specific label (e.g. `Q4_K_M`, `128g`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    /// Bit width, ONLY for bit-exact methods (awq/gptq/nvfp4/mxfp4/bitsandbytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -303,6 +324,7 @@ mod tests {
                 protocol: "concord/1".into(),
                 issuer: "eu:stichting-concord-europa".into(),
                 issued_at: "2026-05-13T09:14:22Z".into(),
+                base_model: None,
             },
             license: License {
                 spdx: "Apache-2.0".into(),
@@ -333,6 +355,7 @@ mod tests {
             ],
             pull_policy: None,
             supersedes: None,
+            quantization: None,
             signature: None,
         }
     }
@@ -428,5 +451,47 @@ mod tests {
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.contains("[supersedes]"));
         assert!(s.contains("version  = \"v0.3.0\""));
+    }
+
+    #[test]
+    fn quantization_roundtrips_and_is_optional() {
+        // A manifest WITH quant + base_model round-trips.
+        let toml = r#"
+[manifest]
+name = "org/m-GGUF-Q4_K_M"
+version = "v1"
+protocol = "concord/1"
+issuer = "eu:concordfaces"
+issued_at = "2026-06-17T00:00:00Z"
+base_model = "org/m"
+
+[license]
+spdx = "MIT"
+residency = "eu"
+export = "unrestricted"
+
+[quantization]
+method = "gguf"
+scheme = "Q4_K_M"
+
+[[shard]]
+role = "weights"
+format = "gguf"
+size = 10
+merkle = "b3:0000000000000000000000000000000000000000000000000000000000000000"
+"#;
+        let m = Manifest::parse(toml.as_bytes()).unwrap();
+        assert_eq!(m.manifest.base_model.as_deref(), Some("org/m"));
+        let q = m.quantization.as_ref().unwrap();
+        assert_eq!(q.method, "gguf");
+        assert_eq!(q.scheme.as_deref(), Some("Q4_K_M"));
+        assert_eq!(q.bits, None);
+
+        // A manifest WITHOUT them parses with None (backward compatible).
+        let plain = toml.replace("base_model = \"org/m\"\n", "")
+            .replace("\n[quantization]\nmethod = \"gguf\"\nscheme = \"Q4_K_M\"\n", "");
+        let p = Manifest::parse(plain.as_bytes()).unwrap();
+        assert_eq!(p.manifest.base_model, None);
+        assert!(p.quantization.is_none());
     }
 }
