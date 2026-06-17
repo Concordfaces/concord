@@ -376,7 +376,7 @@ fn make_pull_progress() -> PullProgress {
         } => {
             let pb = mp.add(ProgressBar::new(size));
             let style = ProgressStyle::with_template(
-                "  {prefix} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}",
+                "  {prefix} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta}) {msg}",
             )
             .expect("progress template")
             .progress_chars("=>-");
@@ -405,9 +405,10 @@ fn make_pull_progress() -> PullProgress {
         } => {
             if let Some((pb, _resumed)) = bars.lock().unwrap().get(&idx) {
                 pb.inc(bytes);
-                if cache_hit {
-                    pb.set_message("cache-hit");
-                }
+                // Reflect the latest chunk's source — clear a stale "cache-hit"
+                // once we're fetching over the wire (otherwise it sticks for the
+                // whole shard after a single early cache hit).
+                pb.set_message(if cache_hit { "cache-hit" } else { "" });
             }
         }
         PullEvent::ShardDone { idx, filename } => {
