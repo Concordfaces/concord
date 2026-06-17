@@ -178,6 +178,9 @@ impl Manifest {
         // string form here for round-trip simplicity — signature covers
         // bytes so format must be deterministic, not its TOML type.
         write_kv_str(&mut out, "issued_at", &self.manifest.issued_at);
+        if let Some(bm) = &self.manifest.base_model {
+            write_kv_str(&mut out, "base_model", bm);
+        }
         writeln!(out).unwrap();
 
         // ---- [license] ----
@@ -215,6 +218,19 @@ impl Manifest {
             writeln!(out, "[supersedes]").unwrap();
             write_kv_str(&mut out, "version", &sp.version);
             write_kv_str(&mut out, "reason", &sp.reason);
+            writeln!(out).unwrap();
+        }
+
+        // ---- [quantization] (optional) ----
+        if let Some(q) = &self.quantization {
+            writeln!(out, "[quantization]").unwrap();
+            write_kv_str(&mut out, "method", &q.method);
+            if let Some(scheme) = &q.scheme {
+                write_kv_str(&mut out, "scheme", scheme);
+            }
+            if let Some(bits) = q.bits {
+                writeln!(out, "bits     = {}", bits).unwrap();
+            }
             writeln!(out).unwrap();
         }
 
@@ -493,5 +509,27 @@ merkle = "b3:0000000000000000000000000000000000000000000000000000000000000000"
         let p = Manifest::parse(plain.as_bytes()).unwrap();
         assert_eq!(p.manifest.base_model, None);
         assert!(p.quantization.is_none());
+    }
+
+    #[test]
+    fn quantization_is_covered_by_signature() {
+        // Build a signed manifest with quant + base_model, then tamper the
+        // quant method and confirm verification now FAILS (i.e. the field is in
+        // the signed canonical bytes).
+        use crate::sign;
+        let (sk, vk) = sign::generate_keypair();
+        let mut m = sample_manifest();
+        m.manifest.base_model = Some("org/base".into());
+        m.quantization = Some(Quantization { method: "gguf".into(), scheme: Some("Q4_K_M".into()), bits: None });
+        let signed = sign::sign(m, "eu:concordfaces:k/test", &sk).unwrap();
+        assert!(sign::verify(&signed, &vk).is_ok(), "untampered must verify");
+
+        let mut tampered = signed.clone();
+        tampered.quantization.as_mut().unwrap().method = "awq".into();
+        assert!(sign::verify(&tampered, &vk).is_err(), "tampered quant must fail verification");
+
+        let mut tampered2 = signed.clone();
+        tampered2.manifest.base_model = Some("org/evil".into());
+        assert!(sign::verify(&tampered2, &vk).is_err(), "tampered base_model must fail verification");
     }
 }
