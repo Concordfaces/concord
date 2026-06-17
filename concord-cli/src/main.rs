@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use concord_cli::fmt::human_bytes;
 use concord_cli::key::{load_signing_key, parse_pubkey_hex, resolve_issuer_key};
@@ -166,6 +166,11 @@ enum ManifestOp {
         /// Path to the ed25519 signing key (PKCS#8 PEM or hex).
         #[arg(long)]
         key: PathBuf,
+        /// Operator-namespaced key id for the `[signature]` table, e.g.
+        /// `eu:concordfaces:k/2026-05`. If omitted, reuses the key id already
+        /// in the manifest (re-signing in place).
+        #[arg(long = "key-id")]
+        key_id: Option<String>,
     },
 }
 
@@ -266,10 +271,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Verify { path, pubkey } => verify(&path, &pubkey),
         Cmd::Manifest { op } => match op {
-            ManifestOp::Sign { path, key } => {
-                tracing::info!(?path, ?key, "manifest sign not yet implemented");
-                bail!("manifest sign not yet implemented");
-            }
+            ManifestOp::Sign { path, key, key_id } => manifest_sign(&path, &key, key_id),
         },
     }
 }
@@ -425,6 +427,29 @@ fn make_pull_progress() -> PullProgress {
             }
         }
     })
+}
+
+/// Sign (or re-sign) a manifest TOML in place. Adds/overwrites the
+/// `[signature]` table using `key`; the key id is `key_id` or, when omitted,
+/// the manifest's existing signature key (re-signing in place after an edit).
+fn manifest_sign(
+    path: &std::path::Path,
+    key: &std::path::Path,
+    key_id: Option<String>,
+) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("read manifest {}", path.display()))?;
+    let manifest = Manifest::parse(&bytes).context("parse manifest")?;
+    let sk = load_signing_key(key).context("load --key")?;
+    let kid = key_id
+        .or_else(|| manifest.signature.as_ref().map(|s| s.key.clone()))
+        .ok_or_else(|| {
+            anyhow!("--key-id required (manifest has no existing signature to reuse)")
+        })?;
+    let signed = sign::sign(manifest, &kid, &sk).map_err(|e| anyhow!("sign manifest: {e}"))?;
+    let out = toml::to_string(&signed).context("serialize signed manifest")?;
+    fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
+    println!("signed {} (key_id {})", path.display(), kid);
+    Ok(())
 }
 
 fn verify(path: &std::path::Path, pubkey_hex: &str) -> Result<()> {
