@@ -504,8 +504,10 @@ merkle = "b3:0000000000000000000000000000000000000000000000000000000000000000"
         assert_eq!(q.bits, None);
 
         // A manifest WITHOUT them parses with None (backward compatible).
-        let plain = toml.replace("base_model = \"org/m\"\n", "")
-            .replace("\n[quantization]\nmethod = \"gguf\"\nscheme = \"Q4_K_M\"\n", "");
+        let plain = toml.replace("base_model = \"org/m\"\n", "").replace(
+            "\n[quantization]\nmethod = \"gguf\"\nscheme = \"Q4_K_M\"\n",
+            "",
+        );
         let p = Manifest::parse(plain.as_bytes()).unwrap();
         assert_eq!(p.manifest.base_model, None);
         assert!(p.quantization.is_none());
@@ -520,16 +522,26 @@ merkle = "b3:0000000000000000000000000000000000000000000000000000000000000000"
         let (sk, vk) = sign::generate_keypair();
         let mut m = sample_manifest();
         m.manifest.base_model = Some("org/base".into());
-        m.quantization = Some(Quantization { method: "gguf".into(), scheme: Some("Q4_K_M".into()), bits: None });
+        m.quantization = Some(Quantization {
+            method: "gguf".into(),
+            scheme: Some("Q4_K_M".into()),
+            bits: None,
+        });
         let signed = sign::sign(m, "eu:concordfaces:k/test", &sk).unwrap();
         assert!(sign::verify(&signed, &vk).is_ok(), "untampered must verify");
 
         let mut tampered = signed.clone();
         tampered.quantization.as_mut().unwrap().method = "awq".into();
-        assert!(sign::verify(&tampered, &vk).is_err(), "tampered quant must fail verification");
+        assert!(
+            sign::verify(&tampered, &vk).is_err(),
+            "tampered quant must fail verification"
+        );
 
         let mut tampered2 = signed.clone();
         tampered2.manifest.base_model = Some("org/evil".into());
-        assert!(sign::verify(&tampered2, &vk).is_err(), "tampered base_model must fail verification");
+        assert!(
+            sign::verify(&tampered2, &vk).is_err(),
+            "tampered base_model must fail verification"
+        );
     }
 }
