@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use concord_core::chunker::{self, ChunkHash, ChunkRef};
-use concord_core::manifest::{License, Manifest, ManifestHeader, Shard};
+use concord_core::manifest::{License, Manifest, ManifestHeader, Quantization, Shard};
 use concord_core::shard::shard_merkle;
 use concord_core::sign;
 use concord_core::store::Store;
@@ -47,6 +47,23 @@ impl PushStats {
         self.bytes_uploaded += other.bytes_uploaded;
         self.bytes_skipped += other.bytes_skipped;
     }
+}
+
+/// Parse `--quant` as `method[:scheme][/bits]`, e.g. `gguf:Q4_K_M`, `awq/4`,
+/// `gptq:128g/4`, `nvfp4/4`, `fp8`.
+pub fn parse_quant(s: &str) -> Result<Quantization> {
+    let (rest, bits) = match s.rsplit_once('/') {
+        Some((r, b)) => (r, Some(b.parse::<u8>().with_context(|| format!("quant bits in {s:?}"))?)),
+        None => (s, None),
+    };
+    let (method, scheme) = match rest.split_once(':') {
+        Some((m, sc)) => (m, Some(sc.to_string())),
+        None => (rest, None),
+    };
+    if method.is_empty() {
+        bail!("--quant needs a method, e.g. gguf:Q4_K_M, awq/4, nvfp4/4");
+    }
+    Ok(Quantization { method: method.to_string(), scheme, bits })
 }
 
 /// Required arguments for [`push`]. Mirrors the CLI flags one-to-one.
@@ -550,6 +567,20 @@ mod tests {
             issued_at: Some("2026-05-26T00:00:00Z".into()),
         };
         assert!(push(&store, &args, &sk).await.is_err());
+    }
+
+    #[test]
+    fn parse_quant_variants() {
+        use concord_core::manifest::Quantization;
+        let p = |s: &str| super::parse_quant(s).unwrap();
+        assert_eq!(p("gguf:Q4_K_M"), Quantization { method: "gguf".into(), scheme: Some("Q4_K_M".into()), bits: None });
+        assert_eq!(p("awq/4"), Quantization { method: "awq".into(), scheme: None, bits: Some(4) });
+        assert_eq!(p("gptq:128g/4"), Quantization { method: "gptq".into(), scheme: Some("128g".into()), bits: Some(4) });
+        assert_eq!(p("nvfp4/4"), Quantization { method: "nvfp4".into(), scheme: None, bits: Some(4) });
+        assert_eq!(p("mxfp4/4"), Quantization { method: "mxfp4".into(), scheme: None, bits: Some(4) });
+        assert_eq!(p("fp8"), Quantization { method: "fp8".into(), scheme: None, bits: None });
+        assert!(super::parse_quant("").is_err());
+        assert!(super::parse_quant("/4").is_err()); // no method
     }
 
     #[tokio::test]
