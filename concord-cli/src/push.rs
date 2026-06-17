@@ -811,4 +811,35 @@ mod tests {
         assert_eq!(q.method, "gguf");
         assert_eq!(q.scheme.as_deref(), Some("Q4_K_M"));
     }
+
+    #[tokio::test]
+    async fn push_quant_flag_overrides_autoderive() {
+        use concord_core::store::Store;
+        let dir = tempfile::tempdir().unwrap();
+        // a .gguf would auto-derive gguf:Q4_K_M, but the explicit flag must win.
+        std::fs::write(dir.path().join("model.Q4_K_M.gguf"), b"weights-bytes").unwrap();
+
+        let (sk, _vk) = sign::generate_keypair();
+        let store = MemoryStore::new();
+        let args = PushArgs {
+            model_dir: dir.path().to_path_buf(),
+            name: "org/m-AWQ".into(),
+            version: "v1".into(),
+            key_id: "eu:concordfaces:k/test".into(),
+            residency: "eu".into(),
+            license_spdx: "MIT".into(),
+            issued_at: Some("2026-06-17T00:00:00Z".into()),
+            base_model: None,
+            quant: Some("awq/4".into()),
+        };
+
+        push(&store, &args, &sk).await.unwrap();
+
+        let raw = store.get_manifest("org/m-AWQ", "v1").await.unwrap();
+        let m = concord_core::manifest::Manifest::parse(&raw).unwrap();
+        let q = m.quantization.unwrap();
+        assert_eq!(q.method, "awq");
+        assert_eq!(q.bits, Some(4));
+        assert_eq!(q.scheme, None);
+    }
 }
