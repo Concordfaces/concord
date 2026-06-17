@@ -225,6 +225,23 @@ fn chunk_concurrency() -> usize {
         .unwrap_or(16)
 }
 
+/// Global cap on concurrent over-the-wire chunk fetches, across ALL shards.
+/// The operator's reconstruct path serializes/contends under load — measured
+/// cold throughput peaks near 2 in-flight and collapses past ~4 — so a small
+/// global cap downloads FASTER than wide fan-out (and avoids 503s). Raise once
+/// the origin streams properly. `CONCORD_MAX_INFLIGHT`; default 2.
+fn inflight_sem() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| {
+        let n = std::env::var("CONCORD_MAX_INFLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(2);
+        tokio::sync::Semaphore::new(n)
+    })
+}
+
 /// Chunks committed before fsync+marker advance. 1 = safest. `CONCORD_COMMIT_EVERY`; default 1.
 fn commit_every() -> u32 {
     std::env::var("CONCORD_COMMIT_EVERY")
@@ -287,10 +304,20 @@ async fn fetch_one_chunk<S: Store + ?Sized>(
             }
         }
     }
-    let b = store
-        .get_chunk(h)
-        .await
-        .map_err(|e| anyhow!("get chunk {h}: {e}"))?;
+    // Cap concurrent OVER-THE-WIRE fetches globally (across all shards). The
+    // operator's reconstruct path contends under load — measured cold
+    // throughput peaks near 2 in-flight and collapses past ~4 — so a small
+    // global cap is FASTER than wide fan-out. Cache hits (above) never wait.
+    let b = {
+        let _permit = inflight_sem()
+            .acquire()
+            .await
+            .expect("inflight semaphore not closed");
+        store
+            .get_chunk(h)
+            .await
+            .map_err(|e| anyhow!("get chunk {h}: {e}"))?
+    };
     let got = ChunkHash::of(&b);
     if got != *h {
         bail!("chunk {h} content hash mismatch: got {got}");
