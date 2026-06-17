@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use concord_core::chunker::{self, ChunkHash, ChunkRef};
-use concord_core::manifest::{License, Manifest, ManifestHeader, Shard};
+use concord_core::manifest::{License, Manifest, ManifestHeader, Quantization, Shard};
 use concord_core::shard::shard_merkle;
 use concord_core::sign;
 use concord_core::store::Store;
@@ -49,6 +49,82 @@ impl PushStats {
     }
 }
 
+/// GGUF scheme from a `*.<SCHEME>.gguf` filename (`model.Q4_K_M.gguf` → `Q4_K_M`).
+/// `None` when there's no scheme segment.
+fn gguf_scheme(fname: &str) -> Option<String> {
+    let stem = fname.strip_suffix(".gguf")?;
+    stem.rsplit_once('.').map(|(_, sc)| sc.to_string())
+}
+
+/// Best-effort quantization from a single unambiguous source signal. `None` if
+/// nothing clear. Never errors (any IO/parse failure → None).
+fn derive_quant(dir: &Path) -> Option<Quantization> {
+    let ggufs: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".gguf"))
+        .collect();
+    if ggufs.len() == 1 {
+        return Some(Quantization {
+            method: "gguf".into(),
+            scheme: gguf_scheme(&ggufs[0]),
+            bits: None,
+        });
+    }
+    if ggufs.len() > 1 {
+        return None; // ambiguous — pusher declares via --quant
+    }
+    let cfg = std::fs::read(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
+    let qc = v.get("quantization_config")?;
+    let method = qc.get("quant_method")?.as_str()?.to_string();
+    let bits = qc
+        .get("bits")
+        .or_else(|| qc.get("w_bit"))
+        .and_then(|b| b.as_u64())
+        .and_then(|b| u8::try_from(b).ok());
+    Some(Quantization {
+        method,
+        scheme: None,
+        bits,
+    })
+}
+
+/// Base model from `config.json.base_model`, when present.
+fn derive_base_model(dir: &Path) -> Option<String> {
+    let cfg = std::fs::read(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
+    v.get("base_model")?.as_str().map(|s| s.to_string())
+}
+
+/// Parse `--quant` as `method[:scheme][/bits]`, e.g. `gguf:Q4_K_M`, `awq/4`,
+/// `gptq:128g/4`, `nvfp4/4`, `fp8`.
+pub fn parse_quant(s: &str) -> Result<Quantization> {
+    let (rest, bits) = match s.rsplit_once('/') {
+        Some((r, b)) => (
+            r,
+            Some(
+                b.parse::<u8>()
+                    .with_context(|| format!("quant bits in {s:?}"))?,
+            ),
+        ),
+        None => (s, None),
+    };
+    let (method, scheme) = match rest.split_once(':') {
+        Some((m, sc)) => (m, Some(sc.to_string())),
+        None => (rest, None),
+    };
+    if method.is_empty() {
+        bail!("--quant needs a method, e.g. gguf:Q4_K_M, awq/4, nvfp4/4");
+    }
+    Ok(Quantization {
+        method: method.to_string(),
+        scheme,
+        bits,
+    })
+}
+
 /// Required arguments for [`push`]. Mirrors the CLI flags one-to-one.
 #[derive(Clone, Debug)]
 pub struct PushArgs {
@@ -60,6 +136,10 @@ pub struct PushArgs {
     pub license_spdx: String,
     /// RFC 3339 UTC timestamp ending in `Z`. `None` ⇒ `now`.
     pub issued_at: Option<String>,
+    /// `--base-model`: the base this is a quantization of (authoritative).
+    pub base_model: Option<String>,
+    /// `--quant` descriptor (`method[:scheme][/bits]`), authoritative.
+    pub quant: Option<String>,
 }
 
 /// Progress callback emitted per chunk decision. CLI hooks indicatif here;
@@ -173,6 +253,16 @@ pub async fn push_with_progress<S: Store + ?Sized>(
         bail!("issued_at must end in Z (RFC 3339 UTC)");
     }
 
+    // Quantization: flag authoritative, else a single unambiguous source signal.
+    let quantization = match &args.quant {
+        Some(s) => Some(parse_quant(s).context("parse --quant")?),
+        None => derive_quant(&args.model_dir),
+    };
+    let base_model = args
+        .base_model
+        .clone()
+        .or_else(|| derive_base_model(&args.model_dir));
+
     let issuer = derive_issuer(&args.key_id);
     let unsigned = Manifest {
         manifest: ManifestHeader {
@@ -181,6 +271,7 @@ pub async fn push_with_progress<S: Store + ?Sized>(
             protocol: concord_core::PROTOCOL_VERSION.to_string(),
             issuer,
             issued_at,
+            base_model,
         },
         license: License {
             spdx: args.license_spdx.clone(),
@@ -190,6 +281,7 @@ pub async fn push_with_progress<S: Store + ?Sized>(
         shards,
         pull_policy: None,
         supersedes: None,
+        quantization,
         signature: None,
     };
     unsigned.validate().context("manifest validation")?;
@@ -460,6 +552,8 @@ mod tests {
             residency: "eu".into(),
             license_spdx: "Apache-2.0".into(),
             issued_at: Some("2026-05-26T00:00:00Z".into()),
+            base_model: None,
+            quant: None,
         };
 
         let (m, bytes, stats) = push(&store, &args, &sk).await.unwrap();
@@ -496,6 +590,8 @@ mod tests {
             residency: "eu".into(),
             license_spdx: "Apache-2.0".into(),
             issued_at: Some("2026-05-26T00:00:00Z".into()),
+            base_model: None,
+            quant: None,
         };
 
         let (_m, _b, stats) = push(&store, &args, &sk).await.unwrap();
@@ -523,6 +619,8 @@ mod tests {
             residency: "eu".into(),
             license_spdx: "Apache-2.0".into(),
             issued_at: Some("2026-05-26T00:00:00Z".into()),
+            base_model: None,
+            quant: None,
         };
         let (_, _, s1) = push(&store, &args, &sk).await.unwrap();
         assert_eq!(s1.chunks_uploaded, 1);
@@ -546,8 +644,66 @@ mod tests {
             residency: "eu".into(),
             license_spdx: "Apache-2.0".into(),
             issued_at: Some("2026-05-26T00:00:00Z".into()),
+            base_model: None,
+            quant: None,
         };
         assert!(push(&store, &args, &sk).await.is_err());
+    }
+
+    #[test]
+    fn parse_quant_variants() {
+        use concord_core::manifest::Quantization;
+        let p = |s: &str| super::parse_quant(s).unwrap();
+        assert_eq!(
+            p("gguf:Q4_K_M"),
+            Quantization {
+                method: "gguf".into(),
+                scheme: Some("Q4_K_M".into()),
+                bits: None
+            }
+        );
+        assert_eq!(
+            p("awq/4"),
+            Quantization {
+                method: "awq".into(),
+                scheme: None,
+                bits: Some(4)
+            }
+        );
+        assert_eq!(
+            p("gptq:128g/4"),
+            Quantization {
+                method: "gptq".into(),
+                scheme: Some("128g".into()),
+                bits: Some(4)
+            }
+        );
+        assert_eq!(
+            p("nvfp4/4"),
+            Quantization {
+                method: "nvfp4".into(),
+                scheme: None,
+                bits: Some(4)
+            }
+        );
+        assert_eq!(
+            p("mxfp4/4"),
+            Quantization {
+                method: "mxfp4".into(),
+                scheme: None,
+                bits: Some(4)
+            }
+        );
+        assert_eq!(
+            p("fp8"),
+            Quantization {
+                method: "fp8".into(),
+                scheme: None,
+                bits: None
+            }
+        );
+        assert!(super::parse_quant("").is_err());
+        assert!(super::parse_quant("/4").is_err()); // no method
     }
 
     #[tokio::test]
@@ -563,7 +719,127 @@ mod tests {
             residency: "eu".into(),
             license_spdx: "Apache-2.0".into(),
             issued_at: Some("2026-05-26T00:00:00Z".into()),
+            base_model: None,
+            quant: None,
         };
         assert!(push(&store, &args, &sk).await.is_err());
+    }
+
+    #[test]
+    fn gguf_scheme_from_filename() {
+        assert_eq!(
+            super::gguf_scheme("model.Q4_K_M.gguf").as_deref(),
+            Some("Q4_K_M")
+        );
+        assert_eq!(super::gguf_scheme("foo.Q8_0.gguf").as_deref(), Some("Q8_0"));
+        assert_eq!(super::gguf_scheme("model.gguf"), None); // no scheme segment
+        assert_eq!(super::gguf_scheme("model.safetensors"), None);
+    }
+
+    #[test]
+    fn derive_quant_and_base_from_dir() {
+        use concord_core::manifest::Quantization;
+        // one .gguf → gguf + scheme, no bits.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("model.Q5_K_M.gguf"), b"x").unwrap();
+        assert_eq!(
+            super::derive_quant(d.path()),
+            Some(Quantization {
+                method: "gguf".into(),
+                scheme: Some("Q5_K_M".into()),
+                bits: None
+            })
+        );
+
+        // two .gguf → ambiguous → None.
+        std::fs::write(d.path().join("model.Q8_0.gguf"), b"y").unwrap();
+        assert_eq!(super::derive_quant(d.path()), None);
+
+        // config.json quantization_config → method + bits; base_model.
+        let d2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d2.path().join("config.json"),
+            br#"{"quantization_config":{"quant_method":"awq","bits":4},"base_model":"org/base"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::derive_quant(d2.path()),
+            Some(Quantization {
+                method: "awq".into(),
+                scheme: None,
+                bits: Some(4)
+            })
+        );
+        assert_eq!(
+            super::derive_base_model(d2.path()).as_deref(),
+            Some("org/base")
+        );
+
+        // plain dir → no quant, no base.
+        let d3 = tempfile::tempdir().unwrap();
+        std::fs::write(d3.path().join("config.json"), br#"{"hidden_size":4}"#).unwrap();
+        assert_eq!(super::derive_quant(d3.path()), None);
+        assert_eq!(super::derive_base_model(d3.path()), None);
+    }
+
+    #[tokio::test]
+    async fn push_records_quant_and_base_model() {
+        use concord_core::store::Store;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.Q4_K_M.gguf"), b"weights-bytes").unwrap();
+
+        let (sk, _vk) = sign::generate_keypair();
+        let store = MemoryStore::new();
+        let args = PushArgs {
+            model_dir: dir.path().to_path_buf(),
+            name: "org/m-GGUF-Q4_K_M".into(),
+            version: "v1".into(),
+            key_id: "eu:concordfaces:k/test".into(),
+            residency: "eu".into(),
+            license_spdx: "MIT".into(),
+            issued_at: Some("2026-06-17T00:00:00Z".into()),
+            base_model: Some("org/m".into()),
+            quant: None, // auto-derive from the .gguf
+        };
+
+        push(&store, &args, &sk).await.unwrap();
+
+        let raw = store.get_manifest("org/m-GGUF-Q4_K_M", "v1").await.unwrap();
+        let m = concord_core::manifest::Manifest::parse(&raw).unwrap();
+        assert_eq!(m.manifest.base_model.as_deref(), Some("org/m"));
+        let q = m.quantization.unwrap();
+        assert_eq!(q.method, "gguf");
+        assert_eq!(q.scheme.as_deref(), Some("Q4_K_M"));
+    }
+
+    #[tokio::test]
+    async fn push_quant_flag_overrides_autoderive() {
+        use concord_core::store::Store;
+        let dir = tempfile::tempdir().unwrap();
+        // a .gguf would auto-derive gguf:Q4_K_M, but the explicit flag must win.
+        std::fs::write(dir.path().join("model.Q4_K_M.gguf"), b"weights-bytes").unwrap();
+
+        let (sk, _vk) = sign::generate_keypair();
+        let store = MemoryStore::new();
+        let args = PushArgs {
+            model_dir: dir.path().to_path_buf(),
+            name: "org/m-AWQ".into(),
+            version: "v1".into(),
+            key_id: "eu:concordfaces:k/test".into(),
+            residency: "eu".into(),
+            license_spdx: "MIT".into(),
+            issued_at: Some("2026-06-17T00:00:00Z".into()),
+            base_model: None,
+            quant: Some("awq/4".into()),
+        };
+
+        push(&store, &args, &sk).await.unwrap();
+
+        let raw = store.get_manifest("org/m-AWQ", "v1").await.unwrap();
+        let m = concord_core::manifest::Manifest::parse(&raw).unwrap();
+        let q = m.quantization.unwrap();
+        assert_eq!(q.method, "awq");
+        assert_eq!(q.bits, Some(4));
+        assert_eq!(q.scheme, None);
     }
 }

@@ -25,6 +25,7 @@ fn sample() -> Manifest {
             protocol: "concord/1".into(),
             issuer: "eu:test-operator".into(),
             issued_at: "2026-05-26T12:00:00Z".into(),
+            base_model: None,
         },
         license: License {
             spdx: "Apache-2.0".into(),
@@ -42,6 +43,7 @@ fn sample() -> Manifest {
         }],
         pull_policy: None,
         supersedes: None,
+        quantization: None,
         signature: None,
     }
 }

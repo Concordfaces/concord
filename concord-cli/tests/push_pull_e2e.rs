@@ -48,6 +48,8 @@ async fn push_then_pull_roundtrip_preserves_bytes() {
         residency: "eu".into(),
         license_spdx: "Apache-2.0".into(),
         issued_at: Some("2026-05-26T12:00:00Z".into()),
+        base_model: None,
+        quant: None,
     };
     let (manifest, _signed_bytes, pstats) = push(&store, &push_args, &sk).await.unwrap();
 
@@ -110,6 +112,8 @@ async fn pull_rejects_wrong_pubkey() {
             residency: "eu".into(),
             license_spdx: "Apache-2.0".into(),
             issued_at: Some("2026-05-26T12:00:00Z".into()),
+            base_model: None,
+            quant: None,
         },
         &sk,
     )
@@ -151,6 +155,8 @@ async fn second_push_is_full_dedup() {
         residency: "eu".into(),
         license_spdx: "Apache-2.0".into(),
         issued_at: Some("2026-05-26T12:00:00Z".into()),
+        base_model: None,
+        quant: None,
     };
 
     let (_, _, s1) = push(&store, &args, &sk).await.unwrap();
@@ -200,6 +206,8 @@ async fn second_pull_skips_completed_shards() {
             residency: "eu".into(),
             license_spdx: "Apache-2.0".into(),
             issued_at: Some("2026-05-26T12:00:00Z".into()),
+            base_model: None,
+            quant: None,
         },
         &sk,
     )

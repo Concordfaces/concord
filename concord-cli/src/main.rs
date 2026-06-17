@@ -32,6 +32,9 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Clap subcommand enums are stack-allocated only once at program startup; the
+// large-variant size difference is inconsequential for a CLI binary.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Pull a model version from an operator's CDN.
@@ -91,6 +94,13 @@ enum Cmd {
         /// SPDX license identifier.
         #[arg(long, default_value = "Apache-2.0")]
         license: String,
+        /// Base model this is a quantization of, e.g. `zai-org/GLM-5.2`.
+        #[arg(long = "base-model")]
+        base_model: Option<String>,
+        /// Quantization descriptor `method[:scheme][/bits]`, e.g. `gguf:Q4_K_M`,
+        /// `awq/4`, `nvfp4/4`.
+        #[arg(long)]
+        quant: Option<String>,
         #[command(flatten)]
         store: StoreFlags,
     },
@@ -241,6 +251,8 @@ async fn main() -> Result<()> {
             key_id,
             residency,
             license,
+            base_model,
+            quant,
             store,
         } => {
             let sk = load_signing_key(&key).context("load --key")?;
@@ -253,6 +265,8 @@ async fn main() -> Result<()> {
                 residency,
                 license_spdx: license,
                 issued_at: None,
+                base_model,
+                quant,
             };
             let progress = make_push_progress();
             let (manifest, _bytes, stats) =
